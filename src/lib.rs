@@ -8,6 +8,9 @@ pub mod filters;
 pub mod xobject;
 pub mod xref;
 
+#[cfg(feature = "lazy-reader")]
+pub mod lazy;
+
 #[macro_use]
 mod object;
 mod document;
