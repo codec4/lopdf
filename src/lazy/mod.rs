@@ -13,6 +13,7 @@
 //! - [`LoadOptions::filter`](crate::LoadOptions) is ignored.
 
 mod document;
+mod single_page;
 mod source;
 
 pub use document::LazyDocument;

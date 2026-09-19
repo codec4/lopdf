@@ -606,7 +606,70 @@ impl<K: Copy + Eq + Hash, V: Clone> FifoCache<K, V> {
 
 #[cfg(test)]
 mod tests {
-    use super::FifoCache;
+    use super::{FifoCache, LazyDocument, OBJECT_CACHE_BYTES, OBJECT_STREAM_CACHE_BYTES};
+    use crate::content::{Content, Operation};
+    use crate::{Document, LoadOptions, Object, SaveOptions, Stream, dictionary};
+
+    #[test]
+    fn reading_every_page_reuses_shared_fonts_caches_no_streams_and_stays_in_budget() {
+        let mut doc = Document::with_version("1.7");
+        let tree_id = doc.new_object_id();
+        let font = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" });
+        let resources = doc.add_object(dictionary! { "Font" => dictionary! { "F1" => font } });
+        let pages: Vec<Object> = (0..200)
+            .map(|number| {
+                let operations = vec![
+                    Operation::new("BT", vec![]),
+                    Operation::new("Tf", vec!["F1".into(), 12.into()]),
+                    Operation::new(
+                        "Tj",
+                        vec![Object::string_literal(format!("page {number} {}", "x".repeat(2048)))],
+                    ),
+                    Operation::new("ET", vec![]),
+                ];
+                let content = doc.add_object(Stream::new(dictionary! {}, Content { operations }.encode().unwrap()));
+                Object::Reference(doc.add_object(dictionary! {
+                    "Type" => "Page",
+                    "Parent" => tree_id,
+                    "Contents" => content,
+                }))
+            })
+            .collect();
+        doc.objects.insert(
+            tree_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Count" => pages.len() as i64,
+                "Kids" => pages,
+                "Resources" => resources,
+            }),
+        );
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => tree_id });
+        doc.trailer.set("Root", catalog);
+        let mut bytes = Vec::new();
+        doc.save_with_options(&mut bytes, SaveOptions::builder().use_object_streams(true).build())
+            .unwrap();
+
+        let lazy = LazyDocument::from_source(bytes.as_slice(), LoadOptions::default()).unwrap();
+        for id in lazy.get_pages().unwrap().values() {
+            assert!(
+                lazy.extract_page_text_with_limit(*id, 1024 * 1024)
+                    .unwrap()
+                    .starts_with("page")
+            );
+            let objects = lazy.objects.borrow();
+            assert!(objects.total_weight <= OBJECT_CACHE_BYTES);
+            assert!(
+                objects
+                    .entries
+                    .values()
+                    .all(|(object, _)| !matches!(object, Object::Stream(_)))
+            );
+            assert!(lazy.object_streams.borrow().total_weight <= OBJECT_STREAM_CACHE_BYTES.max(1));
+        }
+        // The shared font stays cached rather than being read again for every page.
+        assert!(lazy.objects.borrow().get(&font).is_some());
+    }
 
     #[test]
     fn the_cache_drops_the_oldest_entries_past_its_weight_but_keeps_the_newest() {
