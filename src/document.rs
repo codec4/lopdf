@@ -2,9 +2,10 @@ use super::encodings::Encoding;
 use super::{Bookmark, Dictionary, Object, ObjectId};
 use crate::encryption::crypt_filters::*;
 use crate::encryption::{self, EncryptionState, PasswordAlgorithm};
+use crate::page_content::{DecodeLimits, PageContent};
 use crate::xobject::PdfImage;
 use crate::xref::{Xref, XrefType};
-use crate::{DecompressError, Error, ObjectStream, Result, Stream};
+use crate::{Error, ObjectStream, Result, Stream};
 use log::debug;
 use std::cmp::max;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -596,18 +597,9 @@ impl Document {
 
     /// Get content of a page.
     pub fn get_page_content(&self, page_id: ObjectId) -> Vec<u8> {
-        let mut content = Vec::new();
-        let content_streams = self.get_page_contents(page_id);
-        for object_id in content_streams {
-            if let Ok(content_stream) = self.get_object(object_id).and_then(Object::as_stream) {
-                match content_stream.decompressed_content() {
-                    Ok(data) => content.extend_from_slice(&data),
-                    Err(_) => content.extend_from_slice(&content_stream.content),
-                };
-                content.push(b'\n');
-            }
-        }
-        content
+        // Without bounds, reading cannot fail.
+        self.read_page_content(page_id, DecodeLimits::UNBOUNDED)
+            .unwrap_or_default()
     }
 
     /// Get the content of a page, bounding the total decompressed output to
@@ -629,37 +621,14 @@ impl Document {
     /// *other* than the size limit falls back to its raw bytes, but that fallback
     /// is also kept within the remaining budget.
     pub fn get_page_content_with_limit(&self, page_id: ObjectId, max_decompressed_size: usize) -> Result<Vec<u8>> {
-        let mut content = Vec::new();
-        let content_streams = self.get_page_contents(page_id);
-        for object_id in content_streams {
-            if let Ok(content_stream) = self.get_object(object_id).and_then(Object::as_stream) {
-                let remaining = max_decompressed_size.saturating_sub(content.len());
-                match content_stream.decompressed_content_with_limit(remaining) {
-                    Ok(data) => content.extend_from_slice(&data),
-                    Err(Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
-                        return Err(DecompressError::MemoryLimitExceeded {
-                            limit: max_decompressed_size,
-                        }
-                        .into());
-                    }
-                    // Mirror `get_page_content`'s lenient fallback to the raw
-                    // (still-compressed) bytes when a stream can't be decoded, but
-                    // keep that fallback within the page's remaining budget so a
-                    // large raw stream can't bypass the guard.
-                    Err(_) => {
-                        if content_stream.content.len() > remaining {
-                            return Err(DecompressError::MemoryLimitExceeded {
-                                limit: max_decompressed_size,
-                            }
-                            .into());
-                        }
-                        content.extend_from_slice(&content_stream.content);
-                    }
-                }
-                content.push(b'\n');
-            }
-        }
-        Ok(content)
+        self.read_page_content(page_id, DecodeLimits::uniform(max_decompressed_size))
+    }
+
+    fn read_page_content(&self, page_id: ObjectId, limits: DecodeLimits) -> Result<Vec<u8>> {
+        let mut content = PageContent::new(self, page_id, limits);
+        let mut output = Vec::new();
+        while content.read_into(&mut output)? {}
+        Ok(output)
     }
 
     /// Get resources used by a page.

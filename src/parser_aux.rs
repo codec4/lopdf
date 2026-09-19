@@ -1,5 +1,6 @@
 use log::warn;
 
+use crate::page_content::{DecodeLimits, PageContent};
 use crate::{Dictionary, Object, ObjectId, Stream, parser};
 use crate::{
     Error, Result,
@@ -63,11 +64,18 @@ impl Document {
     /// [`DecompressError::MemoryLimitExceeded`](crate::DecompressError::MemoryLimitExceeded)
     /// if any requested page's content would exceed the limit.
     pub fn extract_text_with_limit(&self, page_numbers: &[u32], max_decompressed_size: usize) -> Result<String> {
-        self.extract_text_inner(page_numbers, Some(max_decompressed_size))
+        self.extract_text_with_limits(page_numbers, DecodeLimits::uniform(max_decompressed_size))
     }
 
-    fn extract_text_inner(&self, page_numbers: &[u32], limit: Option<usize>) -> Result<String> {
-        let text_fragments = self.extract_text_chunks_inner(page_numbers, limit);
+    /// [`Document::extract_text_with_limit`] with separate bounds on each stream held whole and
+    /// on each page's content. Content is parsed as it decodes, so a page's content can be allowed
+    /// far more than a stream that is held whole.
+    pub fn extract_text_with_limits(&self, page_numbers: &[u32], limits: DecodeLimits) -> Result<String> {
+        self.extract_text_inner(page_numbers, Some(limits))
+    }
+
+    fn extract_text_inner(&self, page_numbers: &[u32], limits: Option<DecodeLimits>) -> Result<String> {
+        let text_fragments = self.extract_text_chunks_inner(page_numbers, limits);
         let mut text = String::new();
         for maybe_text_fragment in text_fragments.into_iter() {
             let text_fragment = maybe_text_fragment?;
@@ -88,15 +96,15 @@ impl Document {
     pub fn extract_text_chunks_with_limit(
         &self, page_numbers: &[u32], max_decompressed_size: usize,
     ) -> Vec<Result<String>> {
-        self.extract_text_chunks_inner(page_numbers, Some(max_decompressed_size))
+        self.extract_text_chunks_inner(page_numbers, Some(DecodeLimits::uniform(max_decompressed_size)))
     }
 
-    fn extract_text_chunks_inner(&self, page_numbers: &[u32], limit: Option<usize>) -> Vec<Result<String>> {
+    fn extract_text_chunks_inner(&self, page_numbers: &[u32], limits: Option<DecodeLimits>) -> Vec<Result<String>> {
         let pages: BTreeMap<u32, (u32, u16)> = self.get_pages();
         page_numbers
             .iter()
             .flat_map(|page_number| {
-                let result = self.extract_text_chunks_from_page(&pages, *page_number, limit);
+                let result = self.extract_text_chunks_from_page(&pages, *page_number, limits);
                 match result {
                     Ok(text_chunks) => text_chunks,
                     Err(err) => vec![Err(err)],
@@ -106,7 +114,7 @@ impl Document {
     }
 
     fn extract_text_chunks_from_page(
-        &self, pages: &BTreeMap<u32, (u32, u16)>, page_number: u32, limit: Option<usize>,
+        &self, pages: &BTreeMap<u32, (u32, u16)>, page_number: u32, limits: Option<DecodeLimits>,
     ) -> Result<Vec<Result<String>>> {
         let mut collected_chunks_and_errs: Vec<std::result::Result<String, Error>> = Vec::new();
 
@@ -115,8 +123,8 @@ impl Document {
         let encodings: BTreeMap<Vec<u8>, Encoding> = fonts
             .into_iter()
             .filter_map(|(name, font)| {
-                let encoding = match limit {
-                    Some(max) => font.get_font_encoding_with_limit(self, max),
+                let encoding = match limits {
+                    Some(limits) => font.get_font_encoding_with_limit(self, limits.max_stream_size),
                     None => font.get_font_encoding(self),
                 };
                 match encoding {
@@ -128,16 +136,19 @@ impl Document {
                 }
             })
             .collect();
-        let content_data = match limit {
-            Some(max) => self.get_page_content_with_limit(page_id, max)?,
-            None => self.get_page_content(page_id),
-        };
-        let content = Content::decode(&content_data)?;
+        // The content is parsed as it decodes, so that a page never holds all its operations.
+        let limits = limits.unwrap_or(DecodeLimits::UNBOUNDED);
+        let mut content = PageContent::new(self, page_id, limits);
+        let operations = parser::ChunkedContentOperations::new(
+            |buffer: &mut Vec<u8>| content.read_into(buffer),
+            limits.max_stream_size,
+        );
 
         // each text with different encoding is extracted as separate chunk
         let mut current_encoding = None;
         let mut current_text = String::new();
-        for operation in &content.operations {
+        for operation in operations {
+            let operation = operation?;
             match operation.operator.as_ref() {
                 "Tf" => {
                     let current_font = operation
@@ -853,6 +864,59 @@ mod tests {
             }
             other => panic!("expected MemoryLimitExceeded from ToUnicode font bomb, got {other:?}"),
         }
+    }
+
+    /// Content is parsed as it decodes, so a page's content may go far past the bound on what is
+    /// held whole, while a font stream, or content that does not decode a piece at a time, stays
+    /// within it.
+    #[test]
+    fn extract_text_with_limits_bounds_whole_streams_and_page_content_apart() {
+        use crate::{DecodeLimits, DecompressError, Dictionary, Error, Object, Stream};
+
+        let limits = DecodeLimits {
+            max_stream_size: BOMB_MIB,
+            max_page_content_size: 16 * BOMB_MIB,
+        };
+        let limit_of = |result: crate::Result<String>| match result {
+            Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) => limit,
+            other => panic!("expected MemoryLimitExceeded, got {other:?}"),
+        };
+        let mut doc = create_document_with_texts(&["Hello"]);
+        let page_id = doc.get_pages()[&1];
+        let content_id = doc.get_page_contents(page_id)[0];
+        let mut content = doc.get_page_content(page_id);
+        content.resize(content.len() + 8 * BOMB_MIB, b' ');
+        content.extend_from_slice(b"BT (World) Tj ET");
+        let mut deflated = Stream::new(Dictionary::new(), content.clone());
+        deflated.compress().unwrap();
+        doc.objects.insert(content_id, Object::Stream(deflated));
+
+        let text = doc.extract_text_with_limits(&[1], limits).unwrap();
+        assert!(text.contains("Hello") && text.contains("World"), "{text:?}");
+        assert_eq!(text, doc.extract_text(&[1]).unwrap());
+        assert_eq!(limit_of(doc.extract_text_with_limit(&[1], 4 * BOMB_MIB)), 4 * BOMB_MIB);
+        assert_eq!(
+            limit_of(doc.extract_text_with_limits(
+                &[1],
+                DecodeLimits {
+                    max_page_content_size: 4 * BOMB_MIB,
+                    ..limits
+                }
+            )),
+            4 * BOMB_MIB
+        );
+
+        let hex: Vec<u8> = content
+            .iter()
+            .flat_map(|byte| format!("{byte:02X}").into_bytes())
+            .collect();
+        let mut dict = Dictionary::new();
+        dict.set("Filter", "ASCIIHexDecode");
+        doc.objects.insert(content_id, Object::Stream(Stream::new(dict, hex)));
+        assert_eq!(limit_of(doc.extract_text_with_limits(&[1], limits)), BOMB_MIB);
+
+        let doc = doc_with_tounicode_font_bomb(32 * BOMB_MIB);
+        assert_eq!(limit_of(doc.extract_text_with_limits(&[1], limits)), BOMB_MIB);
     }
 
     #[test]

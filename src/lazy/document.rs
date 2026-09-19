@@ -679,7 +679,7 @@ mod tests {
         let lazy = LazyDocument::from_source(bytes.as_slice(), LoadOptions::default()).unwrap();
         for id in lazy.get_pages().unwrap().values() {
             assert!(
-                lazy.extract_page_text_with_limit(*id, 1024 * 1024)
+                lazy.extract_page_text_with_limits(*id, crate::DecodeLimits::uniform(1024 * 1024))
                     .unwrap()
                     .starts_with("page")
             );

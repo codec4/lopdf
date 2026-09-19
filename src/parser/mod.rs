@@ -691,8 +691,12 @@ fn trim_spaces<'a, O>(
 
 // The following code create parser to parse content stream.
 
+fn is_content_space(byte: &u8) -> bool {
+    b" \t\r\n".contains(byte)
+}
+
 fn content_space(input: ParserInput) -> NomResult<()> {
-    map(take_while(|c| b" \t\r\n".contains(&c)), |_| ()).parse(input)
+    map(take_while(|c| is_content_space(&c)), |_| ()).parse(input)
 }
 
 fn operator(input: ParserInput) -> NomResult<String> {
@@ -832,27 +836,169 @@ fn image_data_stream(input: ParserInput, stream_dict: Dictionary) -> crate::Resu
     Ok((input, Stream::new(stream_dict, content.to_vec())))
 }
 
-fn _content(input: ParserInput) -> NomResult<Content<Vec<Operation>>> {
-    delimited(
-        content_space,
-        map(many0(operation), |operations| Content { operations }),
-        many0(terminated(comment, content_space)),
-    )
-    .parse(input)
+/// What parsing the next content operation from `input` gives.
+enum NextOperation {
+    /// An operation, and how many bytes it took.
+    Operation(Operation, usize),
+    /// The content ends: nothing that follows starts an operation.
+    End,
+    /// The content is not valid.
+    Invalid,
+    /// `input` may end inside the next operation, so more input is needed to tell.
+    MoreInput,
+}
+
+/// Parses the operation at the start of `input`. `complete` tells whether `input` holds the rest
+/// of the content. When it does not, an operation is certain only once something follows it: more
+/// input, or the white space that ends its operator. A parse that ends where the input does could
+/// end differently with more of it.
+fn next_operation(input: ParserInput, complete: bool) -> NextOperation {
+    match operation(input) {
+        Ok((rest, operation)) if complete || !rest.is_empty() || input.last().is_some_and(is_content_space) => {
+            NextOperation::Operation(operation, input.len() - rest.len())
+        }
+        // What cannot start an operation ends the content, as `many0` would end it.
+        Err(nom::Err::Error(_)) if complete => NextOperation::End,
+        Err(_) if complete => NextOperation::Invalid,
+        _ => NextOperation::MoreInput,
+    }
+}
+
+/// The operations of content held whole, parsed one at a time: the operations [`content`]
+/// returns, or, where it fails, one error that ends the iteration.
+struct ContentOperations<'a> {
+    input: ParserInput<'a>,
+    done: bool,
+}
+
+impl<'a> ContentOperations<'a> {
+    fn new(input: ParserInput<'a>) -> Self {
+        let input = content_space(input).map_or(input, |(rest, ())| rest);
+        Self { input, done: false }
+    }
+}
+
+impl Iterator for ContentOperations<'_> {
+    type Item = Result<Operation, error::ParseError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        match next_operation(self.input, true) {
+            NextOperation::Operation(operation, len) => {
+                self.input = &self.input[len..];
+                return Some(Ok(operation));
+            }
+            NextOperation::Invalid => {
+                self.done = true;
+                return Some(Err(error::ParseError::InvalidContentStream));
+            }
+            NextOperation::End | NextOperation::MoreInput => self.done = true,
+        }
+        None
+    }
+}
+
+/// The operations of content that arrives in chunks, parsed as it arrives, so that only the
+/// operation being parsed is held: the same operations as [`content`] gives for the whole
+/// content, or, where it fails, one error that ends the iteration.
+pub(crate) struct ChunkedContentOperations<R> {
+    /// Appends the next chunk of content to the buffer, and returns false once there is none.
+    read: R,
+    buffer: Vec<u8>,
+    position: usize,
+    complete: bool,
+    done: bool,
+    max_operation_size: usize,
+}
+
+impl<R: FnMut(&mut Vec<u8>) -> crate::Result<bool>> ChunkedContentOperations<R> {
+    /// Parses the content that `read` produces. An operation longer than `max_operation_size`
+    /// bytes fails with [`DecompressError::MemoryLimitExceeded`](crate::DecompressError::MemoryLimitExceeded).
+    pub(crate) fn new(read: R, max_operation_size: usize) -> Self {
+        Self {
+            read,
+            buffer: Vec::new(),
+            position: 0,
+            complete: false,
+            done: false,
+            max_operation_size,
+        }
+    }
+
+    /// Reads another chunk, and more until as much content again as is pending has arrived, so
+    /// that a long operation is parsed only a few times as it arrives.
+    fn fill(&mut self) -> crate::Result<()> {
+        self.buffer.drain(..self.position);
+        self.position = 0;
+        if self.buffer.len() > self.max_operation_size {
+            return Err(crate::DecompressError::MemoryLimitExceeded {
+                limit: self.max_operation_size,
+            }
+            .into());
+        }
+        let target = self
+            .buffer
+            .len()
+            .saturating_mul(2)
+            .min(self.max_operation_size.saturating_add(1));
+        loop {
+            if !(self.read)(&mut self.buffer)? {
+                self.complete = true;
+            }
+            if self.complete || self.buffer.len() >= target {
+                return Ok(());
+            }
+        }
+    }
+}
+
+impl<R: FnMut(&mut Vec<u8>) -> crate::Result<bool>> Iterator for ChunkedContentOperations<R> {
+    type Item = crate::Result<Operation>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while !self.done {
+            // White space between operations is not part of either, so it is never held.
+            let input = &self.buffer[self.position..];
+            self.position += input.iter().take_while(|byte| is_content_space(byte)).count();
+            match next_operation(&self.buffer[self.position..], self.complete) {
+                NextOperation::Operation(operation, len) => {
+                    self.position += len;
+                    return Some(Ok(operation));
+                }
+                NextOperation::End => self.done = true,
+                NextOperation::Invalid => {
+                    self.done = true;
+                    return Some(Err(error::ParseError::InvalidContentStream.into()));
+                }
+                NextOperation::MoreInput => {
+                    if let Err(error) = self.fill() {
+                        self.done = true;
+                        return Some(Err(error));
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 pub fn content(input: ParserInput) -> Option<Content<Vec<Operation>>> {
-    strip_nom(_content.parse(input))
+    let operations = ContentOperations::new(input).collect::<Result<_, _>>().ok()?;
+    Some(Content { operations })
 }
 
 pub fn content_strict(input: ParserInput) -> Result<Content<Vec<Operation>>, error::ParseError> {
-    let (rest, content) = _content
-        .parse(input)
+    let mut parsed = ContentOperations::new(input);
+    let operations = parsed.by_ref().collect::<Result<_, _>>()?;
+    let (rest, _) = many0(terminated(comment, content_space))
+        .parse(parsed.input)
         .map_err(|_| error::ParseError::InvalidContentStream)?;
     if !rest.is_empty() {
         return Err(error::ParseError::InvalidContentStream);
     }
-    Ok(content)
+    Ok(Content { operations })
 }
 
 #[cfg(test)]
@@ -925,9 +1071,9 @@ BT
 [(b) 20 (ut generally tak) 10 (e more space than \\311)] TJ
 T* (encoded streams.) Tj
 		";
-        let content = tstrip(_content(test_span(stream)));
+        let content = content_strict(test_span(stream));
         println!("{:?}", content);
-        assert!(content.is_some());
+        assert!(content.is_ok());
     }
 
     #[test]
@@ -1346,5 +1492,64 @@ EI";
         let input = b"[[[[[1]]]]]";
         let obj = _direct_object(crate::reader::MAX_NESTING_DEPTH)(test_span(input));
         assert!(obj.is_ok());
+    }
+
+    /// Parses `input` as it arrives in `chunk`-byte pieces.
+    fn parse_in_chunks(input: &[u8], chunk: usize, max_operation_size: usize) -> crate::Result<Vec<Operation>> {
+        let mut pieces = input.chunks(chunk);
+        ChunkedContentOperations::new(
+            |buffer: &mut Vec<u8>| Ok(pieces.next().map(|piece| buffer.extend_from_slice(piece)).is_some()),
+            max_operation_size,
+        )
+        .collect()
+    }
+
+    #[test]
+    fn content_parsed_in_chunks_of_any_size_is_the_content_parsed_whole() {
+        let cases: &[&[u8]] = &[
+            b"  q 1 0 0 1 10 10 cm\n% comment\n  BT /F1 12 Tf 72.5 712 TD [(Hello) -250 (Wor\\)ld)] TJ\nT* (x) ' 1 2 (y) \" ET Q  ",
+            b"/Span << /A [1 2 <0aff> /N] /B (s) >> BDC 0.5 g 0 0 m 1 1 l S EMC true false null /Name -3.5 .5 Tx",
+            b"q BI /W 2 /H 1 /CS /G /BPC 8 ID \x00\xff EI Q",
+            // An inline image that cannot be decoded is skipped to its `EI`.
+            b"q BI /W 1 /H 1 /CS /Unknown /BPC 8 ID xx EI Q",
+            // Without an `EI`, the content is not valid.
+            b"q BI /W 1 /H 1 /CS /Unknown /BPC 8 ID xxxx",
+            // Parsing stops at an unterminated string.
+            b"q 1 0 0 1 10 10 cm (corrupted Q",
+            b"q Q % a comment without an end of line",
+            b"Tj",
+            b"   \n  ",
+            b"",
+        ];
+        for case in cases {
+            let whole = content(case).map(|content| format!("{:?}", content.operations));
+            for chunk in [1, 2, 3, 5, 8, 13, case.len().max(1)] {
+                let chunked = parse_in_chunks(case, chunk, usize::MAX);
+                assert_eq!(
+                    chunked.ok().map(|operations| format!("{operations:?}")),
+                    whole,
+                    "{:?} in chunks of {chunk}",
+                    String::from_utf8_lossy(case)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_an_operation_counts_toward_the_bound_on_what_is_held() {
+        let mut spaced = b"q".to_vec();
+        spaced.extend(std::iter::repeat_n(b' ', 10_000));
+        spaced.extend_from_slice(b"Q\n");
+        spaced.extend(std::iter::repeat_n(b'\n', 10_000));
+        assert_eq!(parse_in_chunks(&spaced, 7, 16).unwrap().len(), 2);
+
+        let long = format!("({}) Tj", "x".repeat(10_000));
+        assert!(parse_in_chunks(long.as_bytes(), 7, 10_100).is_ok());
+        assert!(matches!(
+            parse_in_chunks(long.as_bytes(), 7, 9_000),
+            Err(crate::Error::Decompress(crate::DecompressError::MemoryLimitExceeded {
+                limit: 9_000
+            }))
+        ));
     }
 }

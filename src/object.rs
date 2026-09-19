@@ -2,6 +2,7 @@ use crate::encodings;
 use crate::encodings::cmap::ToUnicodeCMap;
 use crate::encodings::{Differences, Encoding, Glyph};
 use crate::error::DecompressError;
+use crate::filters::flate::Inflater;
 use crate::{Document, Error, Result};
 use indexmap::IndexMap;
 use log::warn;
@@ -918,7 +919,7 @@ impl Stream {
     /// variants. `limit` is `None` to decode without a size limit, or
     /// `Some(max)` to cap the decoded output at `max` bytes per filter layer.
     fn decode_filters(&self, limit: Option<usize>) -> Result<Vec<u8>> {
-        let params = self.dict.get(b"DecodeParms").and_then(Object::as_dict).ok();
+        let params = self.decode_params();
         let filters = match self.filters() {
             Ok(f) => f,
             // No /Filter key means the stream is uncompressed. The raw content is
@@ -1049,8 +1050,6 @@ impl Stream {
     }
 
     fn decompress_zlib(input: &[u8], params: Option<&Dictionary>, limit: Option<usize>) -> Result<Vec<u8>> {
-        use flate2::read::ZlibDecoder;
-
         // Reserve a starting capacity, but never pre-allocate beyond the limit so
         // a bomb cannot force a huge allocation up front.
         let initial_capacity = match limit {
@@ -1058,21 +1057,7 @@ impl Stream {
             None => input.len().saturating_mul(2),
         };
         let mut output = Vec::with_capacity(initial_capacity);
-
-        if !input.is_empty()
-            && let Err(err) = Self::read_capped(ZlibDecoder::new(input), &mut output, limit)
-        {
-            warn!("{err}");
-            // Zlib decompression failed (e.g. corrupt adler32 checksum in
-            // encrypted PDFs). Retry with raw deflate, skipping the 2-byte
-            // zlib header and ignoring the checksum.
-            if output.is_empty() && input.len() > 2 {
-                use flate2::read::DeflateDecoder;
-                if let Err(raw_err) = Self::read_capped(DeflateDecoder::new(&input[2..]), &mut output, limit) {
-                    warn!("raw deflate fallback also failed: {raw_err}");
-                }
-            }
-        }
+        Inflater::new(input).read_into(&mut output, limit.map_or(usize::MAX, |max| max.saturating_add(1)));
         if let Some(max) = limit
             && output.len() > max
         {
@@ -1212,11 +1197,28 @@ impl Stream {
         Ok(output)
     }
 
+    /// Whether the content decodes by inflating alone, which [`Inflater`] does a piece at a time.
+    pub(crate) fn inflates_alone(&self) -> bool {
+        let predictor = Self::predictor(self.decode_params());
+        matches!(self.filters().as_deref(), Ok([filter]) if *filter == b"FlateDecode")
+            && !(predictor == 2 || (10..=15).contains(&predictor))
+    }
+
+    fn decode_params(&self) -> Option<&Dictionary> {
+        self.dict.get(b"DecodeParms").and_then(Object::as_dict).ok()
+    }
+
+    fn predictor(params: Option<&Dictionary>) -> i64 {
+        params
+            .and_then(|params| params.get(b"Predictor").and_then(Object::as_i64).ok())
+            .unwrap_or(1)
+    }
+
     fn decompress_predictor(mut data: Vec<u8>, params: Option<&Dictionary>) -> Result<Vec<u8>> {
         use crate::filters::png;
 
         if let Some(params) = params {
-            let predictor = params.get(b"Predictor").and_then(Object::as_i64).unwrap_or(1);
+            let predictor = Self::predictor(Some(params));
             if predictor == 2 {
                 // TIFF Predictor 2 (horizontal differencing). Distinct from the PNG
                 // predictors below and previously ignored, so `/Predictor 2` streams

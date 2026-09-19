@@ -7,8 +7,8 @@ use lopdf::content::{Content, Operation};
 use lopdf::lazy::LazyDocument;
 use lopdf::xref::XrefType;
 use lopdf::{
-    Dictionary, Document, EncryptionState, EncryptionVersion, LoadOptions, Object, ObjectId, Permissions, SaveOptions,
-    Stream, StringFormat, dictionary,
+    DecodeLimits, Dictionary, Document, EncryptionState, EncryptionVersion, LoadOptions, Object, ObjectId, Permissions,
+    SaveOptions, Stream, StringFormat, dictionary,
 };
 
 const LIMIT: usize = 16 * 1024 * 1024;
@@ -44,7 +44,7 @@ fn every_page_matches_the_eager_extractor() {
         let lazy = LazyDocument::from_source(bytes.as_slice(), LoadOptions::default()).unwrap();
         for (number, id) in eager.get_pages() {
             let expected = eager.extract_text_with_limit(&[number], LIMIT);
-            let actual = lazy.extract_page_text_with_limit(id, LIMIT);
+            let actual = lazy.extract_page_text_with_limits(id, DecodeLimits::uniform(LIMIT));
             assert_eq!(format!("{actual:?}"), format!("{expected:?}"), "{label}, page {number}");
         }
     }
@@ -52,7 +52,10 @@ fn every_page_matches_the_eager_extractor() {
     // The fixture's pages hold the text each font decodes, so the comparison is not of empty text.
     let bytes = save(&mut fixture.document.clone(), true, true);
     let lazy = LazyDocument::from_source(bytes.as_slice(), LoadOptions::default()).unwrap();
-    let text = |page: ObjectId| lazy.extract_page_text_with_limit(page, LIMIT).unwrap();
+    let text = |page: ObjectId| {
+        lazy.extract_page_text_with_limits(page, DecodeLimits::uniform(LIMIT))
+            .unwrap()
+    };
     assert!(text(fixture.pages[0]).contains("Hello"));
     assert!(text(fixture.pages[0]).contains("BAAB"));
     assert!(text(fixture.pages[1]).contains("\u{c7}a \u{2713}"));
@@ -93,7 +96,7 @@ fn a_decompression_bomb_fails_the_page_as_in_the_eager_extractor() {
     let eager = Document::load_mem(&bytes).unwrap().extract_text_with_limit(&[1], limit);
     let lazy = LazyDocument::from_source(bytes.as_slice(), LoadOptions::default())
         .unwrap()
-        .extract_page_text_with_limit(first, limit);
+        .extract_page_text_with_limits(first, DecodeLimits::uniform(limit));
 
     assert!(matches!(
         lazy,

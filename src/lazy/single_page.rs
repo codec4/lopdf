@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use super::LazyDocument;
 use super::source::RandomAccessSource;
 use crate::resolver::skip_unless_io;
-use crate::{Dictionary, Document, Object, ObjectId, Result, dictionary};
+use crate::{DecodeLimits, Dictionary, Document, Object, ObjectId, Result, dictionary};
 
 /// Font entries that text extraction never reads and that can hold large streams: embedded font
 /// programs, Type 3 glyph procedures, and Type 3 resources.
@@ -68,11 +68,11 @@ impl<S: RandomAccessSource> LazyDocument<S> {
         Ok(document)
     }
 
-    /// The text of page `page_id`, as [`Document::extract_text_with_limit`] extracts it from the
+    /// The text of page `page_id`, as [`Document::extract_text_with_limits`] extracts it from the
     /// whole document.
-    pub fn extract_page_text_with_limit(&self, page_id: ObjectId, max_decompressed_size: usize) -> Result<String> {
+    pub fn extract_page_text_with_limits(&self, page_id: ObjectId, limits: DecodeLimits) -> Result<String> {
         self.single_page_document(page_id)?
-            .extract_text_with_limit(&[1], max_decompressed_size)
+            .extract_text_with_limits(&[1], limits)
     }
 
     /// Copies the fonts of the `/Resources` of a page-tree node: the resources object when it is
@@ -91,19 +91,21 @@ impl<S: RandomAccessSource> LazyDocument<S> {
         Ok(())
     }
 
-    /// Copies object `id` alone, and returns it, or `None` when it cannot be read.
+    /// Copies object `id` alone, and returns what refers onward from it: the object, without the
+    /// content if it is a stream. `None` when it cannot be read.
     fn copy_object(
         &self, document: &mut Document, copied: &mut HashSet<ObjectId>, id: ObjectId,
     ) -> Result<Option<Object>> {
         if !copied.insert(id) {
-            return Ok(document.objects.get(&id).cloned());
+            return Ok(document.objects.get(&id).map(without_content));
         }
-        let object = skip_unless_io(self.get_object(id))?;
-        if let Some(object) = &object {
-            document.objects.insert(id, object.clone());
-            document.max_id = document.max_id.max(id.0);
-        }
-        Ok(object)
+        let Some(object) = skip_unless_io(self.get_object(id))? else {
+            return Ok(None);
+        };
+        let onward = without_content(&object);
+        document.objects.insert(id, object);
+        document.max_id = document.max_id.max(id.0);
+        Ok(Some(onward))
     }
 
     /// Copies every object that `object` refers to, directly or through other objects, except
@@ -123,11 +125,18 @@ impl<S: RandomAccessSource> LazyDocument<S> {
                 }
                 Object::Array(items) => pending.extend(items),
                 Object::Dictionary(dictionary) => pending.extend(entries(dictionary, skipped_keys)),
-                Object::Stream(stream) => pending.extend(entries(stream.dict, skipped_keys)),
                 _ => {}
             }
         }
         Ok(())
+    }
+}
+
+/// `object`, or a stream's dictionary alone: its content refers to nothing, and can be large.
+fn without_content(object: &Object) -> Object {
+    match object {
+        Object::Stream(stream) => Object::Dictionary(stream.dict.clone()),
+        other => other.clone(),
     }
 }
 
