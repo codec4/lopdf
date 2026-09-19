@@ -1570,11 +1570,14 @@ pub const PDF_DOC_ENCODING: CodedCharacterSet = [
     None,
     None,
     None,
+    // tab: defined by PDFDocEncoding, and mapped the same way by pdfium
+    Some(Glyph::from_utf16_code_unit(0x0009)),
+    // line feed: defined by PDFDocEncoding, and mapped the same way by pdfium
+    Some(Glyph::from_utf16_code_unit(0x000A)),
     None,
     None,
-    None,
-    None,
-    None,
+    // carriage return: defined by PDFDocEncoding, and mapped the same way by pdfium
+    Some(Glyph::from_utf16_code_unit(0x000D)),
     None,
     None,
     None,
