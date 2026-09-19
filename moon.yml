@@ -2,7 +2,8 @@ $schema: 'https://moonrepo.dev/schemas/project.json'
 
 # Quote & Note fork of lopdf, a submodule of the quote-and-note repository at packages/lopdf.
 # qnn_document_analysis_native depends on it with default features off, so the checks run that
-# configuration first and upstream's default configuration after it.
+# configuration first and upstream's default configuration after it, both with the fork's
+# lazy-reader feature. rust-check also builds without the feature.
 
 language: 'rust'
 layer: 'library'
@@ -17,17 +18,22 @@ fileGroups:
 
 tasks:
   rust-test:
+    # Without `set -e` only the last command's result would count.
     script: |
-      cargo test --no-default-features
-      cargo test
+      set -e
+      cargo test --no-default-features --features lazy-reader
+      cargo test --features lazy-reader
     inputs:
       - '@globs(sources)'
       - '@globs(tests)'
 
   rust-check:
+    # Without `set -e` only the last command's result would count.
     script: |
-      cargo clippy --no-default-features --all-targets -- -D warnings
-      cargo clippy --all-targets -- -D warnings
+      set -e
+      cargo clippy --no-default-features --features lazy-reader --all-targets -- -D warnings
+      cargo clippy --features lazy-reader --all-targets -- -D warnings
+      cargo check --no-default-features
     inputs:
       - '@globs(sources)'
       - '@globs(tests)'
