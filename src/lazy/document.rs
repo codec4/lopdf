@@ -138,6 +138,13 @@ impl<S: RandomAccessSource> LazyDocument<S> {
         self.trailer.has(b"Encrypt")
     }
 
+    /// Whether the file is encrypted with a user password this reader was not given, so its
+    /// strings and streams are returned still encrypted. [`Document::load`] reads such a file as a
+    /// document without objects.
+    pub fn needs_password(&self) -> bool {
+        self.is_encrypted() && self.encryption_state.is_none()
+    }
+
     /// The decryption state when the file is encrypted and a password opened it. Without it,
     /// strings and streams of an encrypted file are returned still encrypted.
     pub fn encryption_state(&self) -> Option<&EncryptionState> {
@@ -249,7 +256,26 @@ impl<S: RandomAccessSource> LazyDocument<S> {
     /// The `/Info` strings, the page count, the version, and whether the file is encrypted, as
     /// [`Document::load_metadata`] reports them, without reading the whole file. The page count
     /// is the number of pages the page tree holds, as in pdfium, rather than the root's `/Count`.
+    /// Like the eager loader, a file that [needs a password](Self::needs_password) reports no
+    /// `/Info` fields and no pages.
     pub fn metadata(&self) -> Result<PdfMetadata> {
+        if self.needs_password() {
+            let info = InfoMetadata::empty();
+            return Ok(PdfMetadata {
+                title: info.title,
+                author: info.author,
+                subject: info.subject,
+                keywords: info.keywords,
+                creator: info.creator,
+                producer: info.producer,
+                creation_date: info.creation_date,
+                modification_date: info.modification_date,
+                custom: info.custom,
+                page_count: 0,
+                version: self.version.clone(),
+                encrypted: true,
+            });
+        }
         let info = skip_unless_io(self.trailer.get(b"Info").and_then(|info| self.dereference(info)))?;
         let info = match info.as_ref().map(Object::as_dict) {
             Some(Ok(dictionary)) => InfoMetadata::from_dictionary(dictionary),

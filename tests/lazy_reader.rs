@@ -53,6 +53,8 @@ fn metadata_matches_the_eager_metadata_loader() {
         let label = format!("Info in object streams {object_streams}");
         sources.push((label, save(&mut doc, object_streams, xref_streams)));
     }
+    // Without its user password, both report no /Info fields and no pages.
+    sources.push(("needs a password".to_owned(), encrypted_document("secret")));
 
     for (label, bytes) in sources {
         let eager = Document::load_metadata_mem(&bytes).unwrap();
