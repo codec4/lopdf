@@ -1,0 +1,39 @@
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+# Quote & Note fork of lopdf, a submodule of the quote-and-note repository at packages/lopdf.
+# qnn_document_analysis_native depends on it with default features off, so the checks run that
+# configuration first and upstream's default configuration after it.
+
+language: 'rust'
+layer: 'library'
+
+fileGroups:
+  sources:
+    - 'src/**/*'
+    - 'Cargo.toml'
+  tests:
+    - 'tests/**/*'
+    - 'assets/**/*'
+
+tasks:
+  rust-test:
+    script: |
+      cargo test --no-default-features
+      cargo test
+    inputs:
+      - '@globs(sources)'
+      - '@globs(tests)'
+
+  rust-check:
+    script: |
+      cargo clippy --no-default-features --all-targets -- -D warnings
+      cargo clippy --all-targets -- -D warnings
+    inputs:
+      - '@globs(sources)'
+      - '@globs(tests)'
+
+  format:
+    command: 'cargo fmt --check'
+    inputs:
+      - '@globs(sources)'
+      - '@globs(tests)'
