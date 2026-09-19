@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::Hash;
@@ -13,6 +14,7 @@ use crate::encryption::{self, EncryptionState};
 use crate::error::{ParseError, XrefError};
 use crate::parser::{self, ParseContext};
 use crate::reader::XREF_OFFSET_RECOVERY_WINDOW;
+use crate::resolver::{ObjectResolver, skip_unless_io};
 use crate::xref::{Xref, XrefEntry, XrefType};
 use crate::{Dictionary, Document, Error, LoadOptions, Object, ObjectId, ObjectStream, Reader, Result};
 
@@ -482,6 +484,20 @@ impl<S: RandomAccessSource> LazyDocument<S> {
     }
 }
 
+impl<S: RandomAccessSource> ObjectResolver for LazyDocument<S> {
+    fn object(&self, id: ObjectId) -> Result<Cow<'_, Object>> {
+        self.get_object(id).map(Cow::Owned)
+    }
+
+    fn trailer(&self) -> &Dictionary {
+        &self.trailer
+    }
+
+    fn page_ids(&self) -> Result<Vec<ObjectId>> {
+        Ok(self.get_pages()?.into_values().collect())
+    }
+}
+
 impl<S: RandomAccessSource> ParseContext for LazyDocument<S> {
     fn strict(&self) -> bool {
         self.strict
@@ -493,16 +509,6 @@ impl<S: RandomAccessSource> ParseContext for LazyDocument<S> {
 
     fn get_object(&self, id: ObjectId, already_seen: &mut HashSet<ObjectId>) -> Result<Object> {
         self.resolve(id, already_seen)
-    }
-}
-
-/// Keeps a failure to read the source, and turns any other error into `None`, the way the eager
-/// reader skips a malformed page tree node.
-fn skip_unless_io<T>(result: Result<T>) -> Result<Option<T>> {
-    match result {
-        Ok(value) => Ok(Some(value)),
-        Err(Error::IO(error)) => Err(Error::IO(error)),
-        Err(_) => Ok(None),
     }
 }
 
