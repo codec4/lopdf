@@ -1,9 +1,9 @@
 //! A document outline (bookmarks) as a flat list, with each item's page and view.
 //!
-//! Unlike [`Document::get_toc`](crate::Document::get_toc), which reports only page numbers and
-//! fails as a whole on one malformed item, [`DocumentOutline`] keeps each destination's view, such
-//! as the `/XYZ` point a heading sits at, skips what it cannot read, and bounds every walk, so a
-//! cyclic or very deep outline cannot hang or exhaust a reader.
+//! [`DocumentOutline`] keeps each destination's view, such as the `/XYZ` point a heading sits at,
+//! skips what it cannot read, and bounds every walk, so a cyclic or very deep outline cannot hang
+//! or exhaust a reader. [`Document::get_toc`](crate::Document::get_toc) reads through it and keeps
+//! only the page numbers.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};

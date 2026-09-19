@@ -1,9 +1,11 @@
 //! `DocumentOutline` reads an outline as a flat list with each item's page and view, skips what it
-//! cannot read, and bounds every walk.
+//! cannot read, and bounds every walk. `Document::get_toc` reads through it, and the tree-shaped
+//! `Document::get_outlines` stops at cycles too.
 
+use indexmap::IndexMap;
 use lopdf::{
-    DestinationView, Dictionary, Document, DocumentOutline, Object, ObjectId, OutlineItem, OutlineLimits,
-    OutlineTarget, StringFormat, dictionary,
+    DestinationView, Dictionary, Document, DocumentOutline, Error, Object, ObjectId, Outline, OutlineItem,
+    OutlineLimits, OutlineTarget, StringFormat, TocType, dictionary,
 };
 
 #[test]
@@ -325,6 +327,81 @@ fn an_item_without_a_title_is_skipped_but_its_children_are_read() {
     assert_eq!(outline.skipped, 1);
 }
 
+#[test]
+fn get_toc_lists_the_items_with_a_page_and_reports_the_rest() {
+    let (mut doc, _) = with_outline(2, |pages| {
+        vec![
+            item("One\r\nline").dest(explicit(pages[0], "Fit", &[])).kids(vec![
+                item("web")
+                    .action(dictionary! { "S" => "URI", "URI" => Object::string_literal("https://example.com") }),
+                item("Two").dest(explicit(pages[1], "Fit", &[])),
+            ]),
+            titled(Object::Integer(7)).dest(explicit(pages[1], "Fit", &[])),
+        ]
+    });
+
+    let toc = doc.get_toc().unwrap();
+
+    assert_eq!(
+        toc.toc,
+        [
+            TocType {
+                level: 1,
+                title: "One line".to_owned(),
+                page: 1
+            },
+            TocType {
+                level: 2,
+                title: "Two".to_owned(),
+                page: 2
+            },
+        ]
+    );
+    assert_eq!(
+        toc.errors,
+        [
+            "Outline item \"web\" has no page in this document",
+            "1 outline items could not be read"
+        ]
+    );
+
+    doc.catalog_mut().unwrap().remove(b"Outlines");
+    assert!(matches!(doc.get_toc(), Err(Error::NoOutline)));
+}
+
+#[test]
+fn get_outlines_stops_at_cycles() {
+    let (mut doc, _) = with_outline(1, |pages| {
+        vec![
+            item("A").dest(explicit(pages[0], "Fit", &[])),
+            item("B")
+                .dest(explicit(pages[0], "Fit", &[]))
+                .kids(vec![item("B.1").dest(explicit(pages[0], "Fit", &[]))]),
+        ]
+    });
+    let [first, second] = top_level_item_ids(&doc)[..] else {
+        panic!("expected two top-level items");
+    };
+    let child = doc
+        .get_dictionary(second)
+        .unwrap()
+        .get(b"First")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    // B leads back to A as its next sibling, and B.1 to B as its child.
+    doc.get_dictionary_mut(second)
+        .unwrap()
+        .set("Next", Object::Reference(first));
+    doc.get_dictionary_mut(child)
+        .unwrap()
+        .set("First", Object::Reference(second));
+
+    let outlines = doc.get_outlines(None, None, &mut IndexMap::new()).unwrap().unwrap();
+
+    assert_eq!(outline_titles(&outlines), "A B (B.1)");
+}
+
 #[cfg(all(feature = "lazy-reader", not(feature = "async")))]
 #[test]
 fn the_lazy_and_eager_documents_read_the_same_outline() {
@@ -499,4 +576,18 @@ fn top_level_item_ids(doc: &Document) -> Vec<ObjectId> {
         ids.push(next);
     }
     ids
+}
+
+/// The titles of an outline tree, with each item's children in parentheses after it.
+fn outline_titles(outlines: &[Outline]) -> String {
+    let titles: Vec<String> = outlines
+        .iter()
+        .map(|outline| match outline {
+            Outline::Destination(destination) => {
+                String::from_utf8_lossy(destination.title().unwrap().as_str().unwrap()).into_owned()
+            }
+            Outline::SubOutlines(children) => format!("({})", outline_titles(children)),
+        })
+        .collect();
+    titles.join(" ")
 }

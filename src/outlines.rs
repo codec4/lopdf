@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use indexmap::IndexMap;
 
 use super::{Destination, Dictionary, Document, Error, Object, ObjectId, Result};
@@ -37,12 +39,14 @@ impl Document {
         &self, node: Option<Object>, outlines: Option<Vec<Outline>>,
         named_destinations: &mut IndexMap<Vec<u8>, Destination>,
     ) -> Result<Option<Vec<Outline>>> {
-        self.get_outlines_impl(node, outlines, named_destinations, 0)
+        self.get_outlines_impl(node, outlines, named_destinations, &mut HashSet::new(), 0)
     }
 
+    /// `visited` holds the outline items already reached by reference, so that an outline whose
+    /// `/First` or `/Next` links lead back to an earlier item ends instead of looping forever.
     fn get_outlines_impl(
         &self, mut node: Option<Object>, mut outlines: Option<Vec<Outline>>,
-        named_destinations: &mut IndexMap<Vec<u8>, Destination>, depth: usize,
+        named_destinations: &mut IndexMap<Vec<u8>, Destination>, visited: &mut HashSet<ObjectId>, depth: usize,
     ) -> Result<Option<Vec<Outline>>> {
         if depth >= crate::reader::MAX_NESTING_DEPTH {
             return Err(Error::RecursionLimit);
@@ -51,6 +55,7 @@ impl Document {
             outlines = Some(Vec::new());
             let catalog = self.catalog()?;
             let mut dict_node = self.get_dict_in_dict(catalog, b"Outlines")?;
+            visited.extend(dict_node.get(b"First").and_then(Object::as_reference).ok());
             let first = self.get_dict_in_dict(dict_node, b"First");
             if let Ok(first) = first {
                 dict_node = first;
@@ -74,6 +79,11 @@ impl Document {
             return Ok(outlines);
         }
         let node = node.unwrap();
+        if let Ok(id) = node.as_reference()
+            && !visited.insert(id)
+        {
+            return Ok(outlines);
+        }
         let mut node = match node.as_dict() {
             Ok(n) => n,
             Err(_) => self.get_object(node.as_reference()?)?.as_dict()?,
@@ -86,14 +96,24 @@ impl Document {
             }
             if let Ok(first) = node.get(b"First") {
                 let sub_outlines = Vec::new();
-                let sub_outlines =
-                    self.get_outlines_impl(Some(first.clone()), Some(sub_outlines), named_destinations, depth + 1)?;
+                let sub_outlines = self.get_outlines_impl(
+                    Some(first.clone()),
+                    Some(sub_outlines),
+                    named_destinations,
+                    visited,
+                    depth + 1,
+                )?;
                 if let Some(sub_outlines) = sub_outlines
                     && !sub_outlines.is_empty()
                     && let Some(ref mut outlines) = outlines
                 {
                     outlines.push(Outline::SubOutlines(sub_outlines));
                 }
+            }
+            if let Ok(next) = node.get(b"Next").and_then(Object::as_reference)
+                && !visited.insert(next)
+            {
+                break;
             }
             node = match self.get_dict_in_dict(node, b"Next") {
                 Ok(n) => n,
