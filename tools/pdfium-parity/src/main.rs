@@ -3,7 +3,7 @@
 //! in `QNN_PDF_CORPUS` (separated by `:`).
 //!
 //! For each PDF it checks that both read the same page count, the same displayed page sizes and
-//! rotations, and the same outline titles, depths, and pages, and that each destination's view
+//! rotations, the same page labels, and the same outline titles, depths, and pages, and that each destination's view
 //! puts the same position at the top of the window. Where an entry has a position on its page,
 //! it also finds the heading's text there and reports how far below the position it starts: a
 //! PDF whose destinations miss their headings is listed, but only generated fixtures fail on it.
@@ -135,8 +135,11 @@ fn print_report(path: &Path, report: &Report) {
         "DIFFER"
     };
     let mut line = format!(
-        "{name:44} {verdict:6} pages {:>4}  outline {:>4}  positioned {:>4}",
-        report.pages, report.outline_items, report.positioned
+        "{name:44} {verdict:6} pages {:>4}{}  outline {:>4}  positioned {:>4}",
+        report.pages,
+        if report.labelled { " labelled" } else { "         " },
+        report.outline_items,
+        report.positioned
     );
     let headings = &report.headings;
     if headings.checked > 0 {

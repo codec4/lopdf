@@ -1,5 +1,5 @@
 //! Generated PDFs whose outline entries lead to headings drawn at known places, on pages with every
-//! combination of box and rotation that changes where a position appears.
+//! combination of box and rotation that changes where a position appears, and one with page labels.
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -70,7 +70,79 @@ pub fn write_all(directory: &Path) -> Vec<PathBuf> {
             paths.push(path);
         }
     }
+    for (name, catch_all) in [("labels", false), ("labels-catch-all", true)] {
+        let path = directory.join(format!("fixture-{name}.pdf"));
+        let mut writer = BufWriter::new(File::create(&path).expect("create a fixture"));
+        labelled(catch_all).save_modern(&mut writer).expect("write a fixture");
+        paths.push(path);
+    }
     paths
+}
+
+/// Sixteen blank pages whose labels use every style, a prefix alone, start values, and a UTF-16
+/// prefix, with a page before the first range, a range that is not a dictionary, and a tree of
+/// kids with limits, one of which lists a key out of order. With `catch_all`, a last kid has
+/// limits that leave out its own key, which pdfium reads as giving every page no label.
+fn labelled(catch_all: bool) -> Document {
+    let pages = (0..16)
+        .map(|_| Page {
+            attributes: dictionary! {},
+            headings: Vec::new(),
+        })
+        .collect();
+    let mut document = build(pages, Vec::new(), Vec::new());
+    let range = |style: Option<&str>, prefix: Option<Object>, start: Option<i64>| {
+        let mut range = Dictionary::new();
+        if let Some(style) = style {
+            range.set("S", Object::Name(style.as_bytes().to_vec()));
+        }
+        if let Some(prefix) = prefix {
+            range.set("P", prefix);
+        }
+        if let Some(start) = start {
+            range.set("St", start);
+        }
+        Object::Dictionary(range)
+    };
+    let utf16 = Object::String(vec![0xfe, 0xff, 0x00, 0xc9, 0x00, 0x2d], StringFormat::Hexadecimal);
+    let first = document.add_object(dictionary! {
+        "Limits" => vec![1.into(), 5.into()],
+        "Nums" => vec![
+            1.into(), range(None, Some(Object::string_literal("Cover")), None),
+            2.into(), range(Some("r"), None, None),
+            5.into(), range(Some("R"), None, Some(1999)),
+        ],
+    });
+    let second = document.add_object(dictionary! {
+        "Limits" => vec![6.into(), 15.into()],
+        "Nums" => vec![
+            6.into(), range(Some("D"), Some(Object::string_literal("A-")), Some(9)),
+            8.into(), range(Some("A"), None, Some(26)),
+            10.into(), range(Some("a"), None, None),
+            11.into(), Object::Integer(7),
+            12.into(), range(Some("D"), Some(utf16), None),
+            15.into(), range(Some("r"), None, None),
+            14.into(), range(Some("R"), None, None),
+        ],
+    });
+    let mut kids = vec![Object::Reference(first), Object::Reference(second)];
+    if catch_all {
+        kids.push(Object::Reference(document.add_object(dictionary! {
+            "Limits" => vec![0.into(), 0.into()],
+            "Nums" => vec![13.into(), range(Some("D"), Some(Object::string_literal("X-")), None)],
+        })));
+    }
+    let labels = document.add_object(dictionary! { "Kids" => kids });
+    let catalog = document
+        .trailer
+        .get(b"Root")
+        .and_then(Object::as_reference)
+        .expect("a catalog");
+    document
+        .get_dictionary_mut(catalog)
+        .expect("a catalog")
+        .set("PageLabels", labels);
+    document
 }
 
 type Fixture = (

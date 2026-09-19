@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use lopdf::lazy::LazyDocument;
-use lopdf::{DocumentOutline, ObjectResolver, OutlineLimits, PageGeometry};
+use lopdf::{DocumentOutline, ObjectResolver, OutlineLimits, PageGeometry, PageLabels};
 use pdfium_render::prelude::*;
 
 /// Points of difference allowed between two page sizes.
@@ -47,6 +47,8 @@ pub struct Headings {
 #[derive(Debug, Default)]
 pub struct Report {
     pub pages: usize,
+    /// Whether the document has page labels.
+    pub labelled: bool,
     pub outline_items: usize,
     pub positioned: usize,
     pub mismatches: Vec<String>,
@@ -105,6 +107,35 @@ pub fn compare(pdfium: &Pdfium, path: &Path) -> Report {
             .mismatches
             .push(format!("page count: lopdf {}, pdfium {}", page_ids.len(), pages.len()));
         return report;
+    }
+
+    let their_labels: Vec<Option<String>> = (0..pages.len())
+        .map(|index| pages.get(index).ok().and_then(|page| page.label().map(str::to_owned)))
+        .collect();
+    match PageLabels::read(&lazy, page_ids.len()) {
+        Ok(None) => {
+            if let Some(index) = their_labels.iter().position(Option::is_some) {
+                report.mismatches.push(format!(
+                    "page labels: lopdf none, pdfium {:?} on page {}",
+                    their_labels[index],
+                    index + 1
+                ));
+            }
+        }
+        Ok(Some(labels)) => {
+            report.labelled = true;
+            for (index, (ours, theirs)) in labels.labels.iter().zip(&their_labels).enumerate() {
+                // pdfium gives no label where it would give an empty one.
+                if ours != theirs.as_deref().unwrap_or_default() {
+                    report
+                        .mismatches
+                        .push(format!("page {} label: lopdf {ours:?}, pdfium {theirs:?}", index + 1));
+                }
+            }
+        }
+        Err(error) => report
+            .mismatches
+            .push(format!("lopdf cannot read the page labels: {error}")),
     }
 
     let mut geometries = Vec::with_capacity(page_ids.len());
