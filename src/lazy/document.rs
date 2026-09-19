@@ -12,11 +12,12 @@ use super::HEADER_SEARCH_LEN;
 use super::source::{FileSource, RandomAccessSource};
 use crate::encryption::{self, EncryptionState};
 use crate::error::{ParseError, XrefError};
+use crate::object_stream::ObjectStreamIndex;
 use crate::parser::{self, ParseContext};
 use crate::reader::XREF_OFFSET_RECOVERY_WINDOW;
 use crate::resolver::{ObjectResolver, skip_unless_io};
 use crate::xref::{Xref, XrefEntry, XrefType};
-use crate::{Dictionary, Document, Error, LoadOptions, Object, ObjectId, ObjectStream, Reader, Result};
+use crate::{Dictionary, Document, Error, LoadOptions, Object, ObjectId, Reader, Result};
 
 /// How much of the end of the source is searched for `startxref`.
 const TAIL_LEN: usize = 1024;
@@ -30,9 +31,16 @@ const MAX_WINDOW: usize = 64 * 1024 * 1024;
 const OBJECT_HEADER_LEN: usize = 32;
 /// Non-stream objects kept after they are read, oldest out first.
 const OBJECT_CACHE_ENTRIES: usize = 4096;
+/// Most bytes of the file, or of decoded object streams, that the kept objects were parsed from.
+/// A parsed object takes several times its bytes, and a page-tree walk reads every page. Walking
+/// the pages of a 753-page book then holds about 7 MB instead of 14 MB, for about 25 ms more.
+const OBJECT_CACHE_BYTES: usize = 256 * 1024;
 /// Decoded object streams kept after they are read. Members of one stream tend to be read
 /// together, and decoding a stream costs a read and a decompression.
 const OBJECT_STREAM_CACHE_ENTRIES: usize = 16;
+/// Most decoded object-stream bytes kept. The newest stream is kept even when it is larger alone,
+/// so that reading its members one after another decodes it once.
+const OBJECT_STREAM_CACHE_BYTES: usize = 1024 * 1024;
 /// Deepest `/Pages` nesting followed, as in [`Document::get_pages`].
 const PAGE_TREE_DEPTH_LIMIT: usize = 256;
 /// Longest chain of references followed to reach an object, as in [`Document::get_object`].
@@ -58,7 +66,7 @@ pub struct LazyDocument<S> {
     encryption_state: Option<EncryptionState>,
     encryption_dictionary: Option<ObjectId>,
     objects: RefCell<FifoCache<ObjectId, Object>>,
-    object_streams: RefCell<FifoCache<u32, Rc<ObjectStream>>>,
+    object_streams: RefCell<FifoCache<u32, Rc<ObjectStreamIndex>>>,
 }
 
 impl LazyDocument<FileSource> {
@@ -100,8 +108,8 @@ impl<S: RandomAccessSource> LazyDocument<S> {
             max_decompressed_size: options.max_decompressed_size,
             encryption_state: None,
             encryption_dictionary: None,
-            objects: RefCell::new(FifoCache::new(OBJECT_CACHE_ENTRIES)),
-            object_streams: RefCell::new(FifoCache::new(OBJECT_STREAM_CACHE_ENTRIES)),
+            objects: RefCell::new(FifoCache::new(OBJECT_CACHE_ENTRIES, OBJECT_CACHE_BYTES)),
+            object_streams: RefCell::new(FifoCache::new(OBJECT_STREAM_CACHE_ENTRIES, OBJECT_STREAM_CACHE_BYTES)),
         };
         let (xref, trailer) = document.resolve_xref_and_trailer()?;
         document.trailer = trailer;
@@ -263,10 +271,10 @@ impl<S: RandomAccessSource> LazyDocument<S> {
         if let Some(object) = self.objects.borrow().get(&id) {
             return Ok(object);
         }
-        let object = match self.reference_table.get(id.0) {
+        let (object, len) = match self.reference_table.get(id.0) {
             Some(XrefEntry::Compressed { container, .. }) => self.compressed_object(id, *container)?,
             Some(XrefEntry::Normal { offset, generation }) if *generation == id.1 => {
-                let (_, mut object) = self.read_object(*offset as usize, Some(id), already_seen)?;
+                let (mut object, len) = self.read_object(*offset as usize, Some(id), already_seen)?;
                 // Like `Document::load`, keep an object whose strings do not all decrypt, as far
                 // as decryption got; some files carry signature data that is not valid ciphertext.
                 if let Some(state) = &self.encryption_state
@@ -275,37 +283,46 @@ impl<S: RandomAccessSource> LazyDocument<S> {
                 {
                     warn!("object {} {} did not fully decrypt: {error}", id.0, id.1);
                 }
-                object
+                (object, len)
             }
             _ => return Err(Error::MissingXrefEntry),
         };
         // Streams can be large and are rarely read twice for structure.
         if !matches!(object, Object::Stream(_)) {
-            self.objects.borrow_mut().insert(id, object.clone());
+            self.objects.borrow_mut().insert(id, object.clone(), len);
         }
         Ok(object)
     }
 
-    fn compressed_object(&self, id: ObjectId, container: u32) -> Result<Object> {
+    /// Parses object `id` from its object stream, and returns it with its length in the decoded
+    /// stream. Only that object is parsed, because a stream can hold hundreds of large objects.
+    fn compressed_object(&self, id: ObjectId, container: u32) -> Result<(Object, usize)> {
         let cached = self.object_streams.borrow().get(&container);
         let object_stream = match cached {
             Some(object_stream) => object_stream,
             None => {
                 let container_object = self.resolve((container, 0), &mut HashSet::new())?;
-                let object_stream = Rc::new(ObjectStream::new_with_limit(
+                let object_stream = Rc::new(ObjectStreamIndex::new(
                     container_object.as_stream()?,
                     self.max_decompressed_size,
                 )?);
-                self.object_streams
-                    .borrow_mut()
-                    .insert(container, Rc::clone(&object_stream));
+                self.object_streams.borrow_mut().insert(
+                    container,
+                    Rc::clone(&object_stream),
+                    object_stream.decoded_len(),
+                );
                 object_stream
             }
         };
-        object_stream.objects.get(&id).cloned().ok_or(Error::MissingXrefEntry)
+        // Objects in an object stream have generation 0.
+        if id.1 != 0 {
+            return Err(Error::MissingXrefEntry);
+        }
+        object_stream.object(id.0).ok_or(Error::MissingXrefEntry)
     }
 
-    /// Parses the indirect object at `offset`.
+    /// Parses the indirect object at `offset`, and returns it with the length of its bytes up to
+    /// the next object.
     ///
     /// The bytes up to the next object are enough for a well-formed object. A wrong neighbouring
     /// offset can cut an object short, and the eager reader parses against the whole file, so the
@@ -313,7 +330,7 @@ impl<S: RandomAccessSource> LazyDocument<S> {
     /// the next object, as in the eager reader.
     fn read_object(
         &self, offset: usize, expected_id: Option<ObjectId>, already_seen: &mut HashSet<ObjectId>,
-    ) -> Result<(ObjectId, Object)> {
+    ) -> Result<(Object, usize)> {
         if offset >= self.len {
             return Err(Error::InvalidOffset(offset));
         }
@@ -325,14 +342,14 @@ impl<S: RandomAccessSource> LazyDocument<S> {
             // A failed attempt may have marked a stream length's object as seen.
             let mut seen = already_seen.clone();
             match parser::indirect_object(&bytes, 0, expected_id, self, &mut seen, Some(end - offset)) {
-                Ok((id, mut object)) => {
+                Ok((_, mut object)) => {
                     *already_seen = seen;
                     if let Object::Stream(stream) = &mut object
                         && let Some(position) = stream.start_position.as_mut()
                     {
                         *position += offset;
                     }
-                    return Ok((id, object));
+                    return Ok((object, end - offset));
                 }
                 Err(_) if window_end < self.len && window_end - offset < MAX_WINDOW => {
                     window_end = offset
@@ -515,31 +532,40 @@ impl<S: RandomAccessSource> ParseContext for LazyDocument<S> {
 /// A cache that holds at most `capacity` entries and drops the oldest first.
 struct FifoCache<K, V> {
     capacity: usize,
-    entries: HashMap<K, V>,
+    /// Most total weight kept; the newest entry is kept even when it weighs more alone.
+    max_weight: usize,
+    total_weight: usize,
+    entries: HashMap<K, (V, usize)>,
     order: VecDeque<K>,
 }
 
 impl<K: Copy + Eq + Hash, V: Clone> FifoCache<K, V> {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, max_weight: usize) -> Self {
         Self {
             capacity,
+            max_weight,
+            total_weight: 0,
             entries: HashMap::new(),
             order: VecDeque::new(),
         }
     }
 
     fn get(&self, key: &K) -> Option<V> {
-        self.entries.get(key).cloned()
+        self.entries.get(key).map(|(value, _)| value.clone())
     }
 
-    fn insert(&mut self, key: K, value: V) {
-        if self.entries.insert(key, value).is_none() {
-            self.order.push_back(key);
+    fn insert(&mut self, key: K, value: V, weight: usize) {
+        match self.entries.insert(key, (value, weight)) {
+            Some((_, replaced)) => self.total_weight -= replaced,
+            None => self.order.push_back(key),
         }
-        while self.entries.len() > self.capacity {
+        self.total_weight += weight;
+        while self.entries.len() > self.capacity || (self.total_weight > self.max_weight && self.entries.len() > 1) {
             match self.order.pop_front() {
                 Some(oldest) => {
-                    self.entries.remove(&oldest);
+                    if let Some((_, weight)) = self.entries.remove(&oldest) {
+                        self.total_weight -= weight;
+                    }
                 }
                 None => break,
             }
@@ -549,5 +575,45 @@ impl<K: Copy + Eq + Hash, V: Clone> FifoCache<K, V> {
     fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
+        self.total_weight = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FifoCache;
+
+    #[test]
+    fn the_cache_drops_the_oldest_entries_past_its_weight_but_keeps_the_newest() {
+        let mut cache = FifoCache::new(8, 10);
+        cache.insert(1, "one", 4);
+        cache.insert(2, "two", 4);
+        assert_eq!((cache.get(&1), cache.get(&2)), (Some("one"), Some("two")));
+
+        cache.insert(3, "three", 4);
+        assert_eq!(cache.get(&1), None);
+        assert_eq!((cache.get(&2), cache.get(&3)), (Some("two"), Some("three")));
+
+        cache.insert(4, "four", 20);
+        assert_eq!(
+            (cache.get(&2), cache.get(&3), cache.get(&4)),
+            (None, None, Some("four"))
+        );
+
+        cache.insert(4, "four again", 1);
+        cache.insert(5, "five", 9);
+        assert_eq!((cache.get(&4), cache.get(&5)), (Some("four again"), Some("five")));
+    }
+
+    #[test]
+    fn the_cache_drops_the_oldest_entries_past_its_capacity() {
+        let mut cache = FifoCache::new(2, usize::MAX);
+        for key in 1..=3 {
+            cache.insert(key, key * 10, 0);
+        }
+        assert_eq!(
+            (cache.get(&1), cache.get(&2), cache.get(&3)),
+            (None, Some(20), Some(30))
+        );
     }
 }

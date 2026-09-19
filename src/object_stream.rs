@@ -1,6 +1,6 @@
 use crate::parser;
 use crate::{Document, Error, Object, ObjectId, Result, Stream};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::num::TryFromIntError;
 use std::str::FromStr;
 
@@ -13,6 +13,112 @@ pub struct ObjectStream {
     pub objects: BTreeMap<ObjectId, Object>,
     max_objects: usize,
     compression_level: u32,
+}
+
+/// An object stream's decoded content and where each of its objects starts, so that objects can be
+/// parsed one at a time instead of all at once.
+pub(crate) struct ObjectStreamIndex {
+    content: Vec<u8>,
+    /// Object number to the offset of its first non-whitespace byte in `content`. A number listed
+    /// twice keeps its last offset.
+    offsets: HashMap<u32, usize>,
+    /// Every object's start offset, sorted, which bounds each object's bytes.
+    #[cfg(feature = "lazy-reader")]
+    starts: Vec<usize>,
+}
+
+impl ObjectStreamIndex {
+    /// Decodes `stream`, rejecting content over `max_decompressed_size` bytes, and reads its index.
+    pub(crate) fn new(stream: &Stream, max_decompressed_size: Option<usize>) -> Result<Self> {
+        let content = match max_decompressed_size {
+            // Object streams are decoded while the document is loaded, so
+            // enforcing the limit here bounds the memory a single stream can use.
+            Some(max) => stream.get_plain_content_with_limit(max)?,
+            None => stream.get_plain_content()?,
+        };
+
+        if content.is_empty() {
+            return Ok(Self::with_offsets(content, HashMap::new()));
+        }
+
+        let first_offset = stream
+            .dict
+            .get(b"First")
+            .and_then(Object::as_i64)?
+            .try_into()
+            .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
+        let index_block = content.get(..first_offset).ok_or(Error::InvalidOffset(first_offset))?;
+
+        let numbers_str = std::str::from_utf8(index_block).map_err(|e| Error::InvalidObjectStream(e.to_string()))?;
+        let numbers: Vec<_> = numbers_str
+            .split_whitespace()
+            .map(|number| u32::from_str(number).ok())
+            .collect();
+        let len = numbers.len() / 2 * 2; // Ensure only pairs.
+
+        let n = stream.dict.get(b"N").and_then(Object::as_i64)?;
+        if numbers.len().try_into().ok() != n.checked_mul(2) {
+            warn!("object stream: the object stream dictionary specifies a wrong number of objects")
+        }
+
+        let offsets = numbers[..len]
+            .chunks(2)
+            .filter_map(|chunk| {
+                let number = chunk[0]?;
+                let offset = first_offset + chunk[1]? as usize;
+                if offset >= content.len() {
+                    warn!("out-of-bounds offset in object stream");
+                    return None;
+                }
+                // Skip leading whitespace — some PDFs emit newlines before objects in ObjStm
+                let start = offset
+                    + content[offset..]
+                        .iter()
+                        .take_while(|byte| byte.is_ascii_whitespace())
+                        .count();
+                if start >= content.len() {
+                    warn!("only whitespace after offset in object stream");
+                    return None;
+                }
+                Some((number, start))
+            })
+            .collect();
+        Ok(Self::with_offsets(content, offsets))
+    }
+
+    fn with_offsets(content: Vec<u8>, offsets: HashMap<u32, usize>) -> Self {
+        #[cfg(feature = "lazy-reader")]
+        let starts = {
+            let mut starts: Vec<usize> = offsets.values().copied().collect();
+            starts.sort_unstable();
+            starts
+        };
+        Self {
+            content,
+            offsets,
+            #[cfg(feature = "lazy-reader")]
+            starts,
+        }
+    }
+
+    /// Parses object `number`, and returns it with the length of its bytes up to the next object,
+    /// or `None` when the stream does not hold it or it does not parse.
+    #[cfg(feature = "lazy-reader")]
+    pub(crate) fn object(&self, number: u32) -> Option<(Object, usize)> {
+        let start = *self.offsets.get(&number)?;
+        let end = self
+            .starts
+            .get(self.starts.partition_point(|&other| other <= start))
+            .copied()
+            .unwrap_or(self.content.len());
+        Some((parser::direct_object(&self.content[start..])?, end - start))
+    }
+
+    /// Size of the decoded content in bytes.
+    #[cfg(feature = "lazy-reader")]
+    pub(crate) fn decoded_len(&self) -> usize {
+        self.content.len()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -51,66 +157,13 @@ impl ObjectStream {
     /// decoded content if it would exceed `max_decompressed_size` bytes. `None`
     /// means no limit (the behavior of [`ObjectStream::new`]).
     pub fn new_with_limit(stream: &Stream, max_decompressed_size: Option<usize>) -> Result<ObjectStream> {
-        let content = match max_decompressed_size {
-            // Object streams are decoded while the document is loaded, so
-            // enforcing the limit here bounds the memory a single stream can use.
-            Some(max) => stream.get_plain_content_with_limit(max)?,
-            None => stream.get_plain_content()?,
-        };
-
-        if content.is_empty() {
-            return Ok(ObjectStream {
-                objects: BTreeMap::new(),
-                max_objects: 100,
-                compression_level: 6,
-            });
-        }
-
-        let first_offset = stream
-            .dict
-            .get(b"First")
-            .and_then(Object::as_i64)?
-            .try_into()
-            .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
-        let index_block = content.get(..first_offset).ok_or(Error::InvalidOffset(first_offset))?;
-
-        let numbers_str = std::str::from_utf8(index_block).map_err(|e| Error::InvalidObjectStream(e.to_string()))?;
-        let numbers: Vec<_> = numbers_str
-            .split_whitespace()
-            .map(|number| u32::from_str(number).ok())
-            .collect();
-        let len = numbers.len() / 2 * 2; // Ensure only pairs.
-
-        let n = stream.dict.get(b"N").and_then(Object::as_i64)?;
-        if numbers.len().try_into().ok() != n.checked_mul(2) {
-            warn!("object stream: the object stream dictionary specifies a wrong number of objects")
-        }
-
-        let chunks_filter_map = |chunk: &[_]| {
-            let id = chunk[0]?;
-            let offset = first_offset + chunk[1]? as usize;
-
-            if offset >= content.len() {
-                warn!("out-of-bounds offset in object stream");
-                return None;
-            }
-            // Skip leading whitespace — some PDFs emit newlines before objects in ObjStm
-            let mut start = offset;
-            while start < content.len() && content[start].is_ascii_whitespace() {
-                start += 1;
-            }
-            if start >= content.len() {
-                warn!("only whitespace after offset in object stream");
-                return None;
-            }
-            let object = parser::direct_object(&content[start..])?;
-
-            Some(((id, 0), object))
-        };
+        let index = ObjectStreamIndex::new(stream, max_decompressed_size)?;
+        let parse =
+            |(&number, &start): (&u32, &usize)| Some(((number, 0), parser::direct_object(&index.content[start..])?));
         #[cfg(feature = "rayon")]
-        let objects = numbers[..len].par_chunks(2).filter_map(chunks_filter_map).collect();
+        let objects = index.offsets.par_iter().filter_map(parse).collect();
         #[cfg(not(feature = "rayon"))]
-        let objects = numbers[..len].chunks(2).filter_map(chunks_filter_map).collect();
+        let objects = index.offsets.iter().filter_map(parse).collect();
 
         Ok(ObjectStream {
             objects,
