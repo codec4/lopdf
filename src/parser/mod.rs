@@ -1,4 +1,4 @@
-use super::{Dictionary, Object, ObjectId, Reader, Stream, StringFormat};
+use super::{Dictionary, Object, ObjectId, Stream, StringFormat};
 use crate::Error;
 use crate::content::*;
 use crate::error;
@@ -21,6 +21,20 @@ use nom::{AsBytes, AsChar, IResult, Input, Parser};
 pub(crate) mod cmap_parser;
 
 pub(crate) type ParserInput<'a> = &'a [u8];
+
+/// What the object parsers need from the document they read: stream lengths stored as indirect
+/// objects, and the leniency and decompression settings. [`crate::Reader`] provides it over an
+/// in-memory buffer; the lazy reader provides it over a random-access source.
+pub(crate) trait ParseContext {
+    /// Reject non-conforming input instead of recovering from it.
+    fn strict(&self) -> bool;
+
+    /// Largest size, in bytes, one stream may decompress to while parsing.
+    fn max_decompressed_size(&self) -> Option<usize>;
+
+    /// Resolves an indirect object, such as a stream's `/Length`. `already_seen` guards cycles.
+    fn get_object(&self, id: ObjectId, already_seen: &mut HashSet<ObjectId>) -> crate::Result<Object>;
+}
 // Change this to something else that implements ParseError to get a
 // different error type out of nom.
 pub(crate) type NomError<'a> = nom::error::Error<ParserInput<'a>>;
@@ -374,7 +388,7 @@ fn recover_stream_length(input: ParserInput) -> Option<(ParserInput, ParserInput
 }
 
 fn stream<'a>(
-    input: ParserInput<'a>, reader: &Reader, already_seen: &mut HashSet<ObjectId>, recover_length: bool,
+    input: ParserInput<'a>, reader: &dyn ParseContext, already_seen: &mut HashSet<ObjectId>, recover_length: bool,
     recovery_bound: Option<usize>,
 ) -> NomResult<'a, Object> {
     let (i, dict) = terminated(dictionary, (space, tag(&b"stream"[..]), space0, eol)).parse(input)?;
@@ -395,7 +409,7 @@ fn stream<'a>(
         };
         match terminated(take(length), pair(opt(eol), tag(&b"endstream"[..]))).parse(i) {
             Ok((remaining, data)) => Ok((remaining, Object::Stream(Stream::new(dict, data.to_vec())))),
-            Err(_) if recover_length && !reader.strict => {
+            Err(_) if recover_length && !reader.strict() => {
                 // The scan must not cross into a neighbouring indirect object,
                 // so it stops at the xref-derived bound; parsing itself stays
                 // unbounded. The bound arrived here as `input.len() - end`, and
@@ -466,8 +480,8 @@ pub fn direct_object(input: ParserInput) -> Option<Object> {
 }
 
 fn object<'a>(
-    input: ParserInput<'a>, reader: &Reader, already_seen: &mut HashSet<ObjectId>, recover_stream_length: bool,
-    recovery_bound: Option<usize>,
+    input: ParserInput<'a>, reader: &dyn ParseContext, already_seen: &mut HashSet<ObjectId>,
+    recover_stream_length: bool, recovery_bound: Option<usize>,
 ) -> NomResult<'a, Object> {
     terminated(
         alt((
@@ -480,7 +494,7 @@ fn object<'a>(
 }
 
 pub fn indirect_object(
-    input: ParserInput, offset: usize, expected_id: Option<ObjectId>, reader: &Reader,
+    input: ParserInput, offset: usize, expected_id: Option<ObjectId>, reader: &dyn ParseContext,
     already_seen: &mut HashSet<ObjectId>, recovery_bound: Option<usize>,
 ) -> crate::Result<(ObjectId, Object)> {
     // Every downstream slice is a suffix of `input`, so express the absolute
@@ -502,7 +516,7 @@ pub fn indirect_object(
 }
 
 fn _indirect_object<'a>(
-    input: ParserInput<'a>, offset: usize, expected_id: Option<ObjectId>, reader: &Reader,
+    input: ParserInput<'a>, offset: usize, expected_id: Option<ObjectId>, reader: &dyn ParseContext,
     already_seen: &mut HashSet<ObjectId>, recover_stream_length: bool, recovery_bound: Option<usize>,
 ) -> crate::Result<(ObjectId, Object)> {
     let (i, (_, object_id)) = terminated((space, object_id), pair(tag(&b"obj"[..]), space))
@@ -628,8 +642,8 @@ fn trailer(input: ParserInput) -> NomResult<Dictionary> {
     delimited(pair(tag(&b"trailer"[..]), space), dictionary, space).parse(input)
 }
 
-pub fn xref_and_trailer(input: ParserInput, reader: &Reader) -> crate::Result<(Xref, Dictionary)> {
-    let xref_trailer = map(pair(|i| xref(i, reader.strict), trailer), |(mut xref, trailer)| {
+pub fn xref_and_trailer(input: ParserInput, reader: &dyn ParseContext) -> crate::Result<(Xref, Dictionary)> {
+    let xref_trailer = map(pair(|i| xref(i, reader.strict()), trailer), |(mut xref, trailer)| {
         xref.size = trailer
             .get(b"Size")
             .and_then(Object::as_i64)
@@ -642,7 +656,7 @@ pub fn xref_and_trailer(input: ParserInput, reader: &Reader) -> crate::Result<(X
             _indirect_object(input, 0, None, reader, &mut HashSet::new(), false, None)
                 .map(|(_, obj)| {
                     let res = match obj {
-                        Object::Stream(stream) => decode_xref_stream_with_limit(stream, reader.max_decompressed_size),
+                        Object::Stream(stream) => decode_xref_stream_with_limit(stream, reader.max_decompressed_size()),
                         _ => Err(crate::error::ParseError::InvalidXref.into()),
                     };
                     (input, res)

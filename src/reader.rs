@@ -469,6 +469,9 @@ impl TryInto<IncrementalDocument> for &[u8] {
     }
 }
 
+/// How far either side of a miswritten cross-reference offset lenient loading looks for `xref`.
+pub(crate) const XREF_OFFSET_RECOVERY_WINDOW: usize = 64;
+
 pub struct Reader<'a> {
     pub buffer: &'a [u8],
     pub document: Document,
@@ -581,6 +584,20 @@ const STANDARD_INFO_KEYS: &[&[u8]] = &[
     b"ModDate",
     b"Trapped",
 ];
+
+impl parser::ParseContext for Reader<'_> {
+    fn strict(&self) -> bool {
+        self.strict
+    }
+
+    fn max_decompressed_size(&self) -> Option<usize> {
+        self.max_decompressed_size
+    }
+
+    fn get_object(&self, id: ObjectId, already_seen: &mut HashSet<ObjectId>) -> Result<Object> {
+        Reader::get_object(self, id, already_seen)
+    }
+}
 
 impl Reader<'_> {
     /// Read metadata (title and page count) without loading the entire document.
@@ -1643,33 +1660,43 @@ impl Reader<'_> {
     /// or an indirect object (cross-reference stream), scan a small window
     /// around it for the `xref` keyword and use the nearest match instead.
     fn correct_xref_offset(&self, offset: usize) -> usize {
-        const RECOVERY_WINDOW: usize = 64;
-
-        if self.strict || offset >= self.buffer.len() {
+        if self.strict {
             return offset;
         }
-        let rest = &self.buffer[offset..];
+        Self::correct_xref_offset_in(self.buffer, 0, offset)
+    }
+
+    /// Lenient correction of a slightly miswritten cross-reference offset, over `window`, the
+    /// bytes that start at `window_start`. The window must cover [`XREF_OFFSET_RECOVERY_WINDOW`]
+    /// bytes on either side of `offset` (plus the five before, to rule out `startxref`), or reach
+    /// the end of the source; the whole buffer always does.
+    pub(crate) fn correct_xref_offset_in(window: &[u8], window_start: usize, offset: usize) -> usize {
+        let Some(local) = offset.checked_sub(window_start).filter(|&local| local < window.len()) else {
+            return offset;
+        };
+        let rest = &window[local..];
         if rest.starts_with(b"xref") || Self::starts_indirect_object(rest) {
             return offset;
         }
 
-        let window_start = offset.saturating_sub(RECOVERY_WINDOW);
-        let window_end = cmp::min(self.buffer.len(), offset + RECOVERY_WINDOW);
+        let search_start = local.saturating_sub(XREF_OFFSET_RECOVERY_WINDOW);
+        let search_end = cmp::min(window.len(), local + XREF_OFFSET_RECOVERY_WINDOW);
         let mut corrected: Option<usize> = None;
-        for pos in window_start..window_end.saturating_sub(4) {
-            if !self.buffer[pos..].starts_with(b"xref") {
+        for pos in search_start..search_end.saturating_sub(4) {
+            if !window[pos..].starts_with(b"xref") {
                 continue;
             }
             // `startxref` contains `xref`; never match inside it.
-            if pos >= 5 && &self.buffer[pos - 5..pos] == b"start" {
+            if pos >= 5 && &window[pos - 5..pos] == b"start" {
                 continue;
             }
-            if corrected.is_none_or(|best: usize| pos.abs_diff(offset) < best.abs_diff(offset)) {
+            if corrected.is_none_or(|best: usize| pos.abs_diff(local) < best.abs_diff(local)) {
                 corrected = Some(pos);
             }
         }
         match corrected {
             Some(pos) => {
+                let pos = window_start + pos;
                 warn!(
                     "Cross-reference offset {} does not point at an xref section; using nearby offset {} instead.",
                     offset, pos
@@ -1686,7 +1713,7 @@ impl Reader<'_> {
         Self::parse_object_header(input).is_some()
     }
 
-    fn get_xref_start(buffer: &[u8]) -> Result<usize> {
+    pub(crate) fn get_xref_start(buffer: &[u8]) -> Result<usize> {
         let seek_pos = buffer.len() - cmp::min(buffer.len(), 512);
         Self::search_substring(buffer, b"%%EOF", seek_pos)
             .filter(|&eof_pos| eof_pos > 25)
