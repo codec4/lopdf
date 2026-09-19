@@ -8,3 +8,5 @@ specs
 .DS_Store
 /notes
 ops.txt
+# The pdfium parity tool is an application, so its lockfile is kept.
+!tools/pdfium-parity/Cargo.lock

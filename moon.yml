@@ -43,3 +43,24 @@ tasks:
     inputs:
       - '@globs(sources)'
       - '@globs(tests)'
+
+  pdfium-parity:
+    # Compares page geometry and outline reading with pdfium, the library behind the Android PDF
+    # renderer, on generated fixtures and assets/. Set QNN_PDF_CORPUS to folders of real PDFs,
+    # separated by ':', to check them too. The first run downloads a pinned pdfium build into the
+    # user cache, so this task is not part of rust-test or rust-check.
+    script: |
+      set -e
+      pdfium=$(tools/pdfium-parity/fetch-pdfium.sh)
+      cd tools/pdfium-parity
+      cargo clippy --release --locked --all-targets -- -D warnings
+      cargo fmt --check
+      cargo run --release --locked -- --pdfium "$pdfium"
+    inputs:
+      - '@globs(sources)'
+      - 'assets/**/*'
+      - 'tools/pdfium-parity/**/*'
+    env:
+      QNN_PDF_CORPUS: '$QNN_PDF_CORPUS'
+    options:
+      cache: false

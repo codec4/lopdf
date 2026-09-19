@@ -1,0 +1,15 @@
+[package]
+name = "pdfium-parity"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Compares this lopdf fork's page geometry and outline reading with pdfium."
+
+[dependencies]
+lopdf = { path = "../..", default-features = false, features = ["lazy-reader"] }
+# Keep the pdfium_* feature in step with the build fetch-pdfium.sh downloads.
+pdfium-render = { version = "=0.9.4", default-features = false, features = ["pdfium_7881", "thread_safe"] }
+tempfile = "3.23.0"
+
+# A tool of its own, outside the lopdf package, built only by `moon run lopdf:pdfium-parity`.
+[workspace]
