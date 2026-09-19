@@ -39,6 +39,7 @@ mod parser_aux;
 mod reader;
 mod resolver;
 mod save_options;
+mod stored_bytes;
 
 #[cfg(feature = "font_embedding")]
 mod font;

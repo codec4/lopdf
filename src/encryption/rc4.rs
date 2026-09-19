@@ -30,15 +30,18 @@ impl Rc4 {
         Input: Iterator<Item = &'i u8>,
         Output: Iterator<Item = &'o mut u8>,
     {
-        let mut state = self.initial_state;
-        let mut i = 0_u8;
-        let mut j = 0_u8;
+        let mut keystream = self.keystream();
         for (i_byte, o_byte) in input.zip(output) {
-            i = i.wrapping_add(1);
-            j = j.wrapping_add(state[i as usize]);
-            state.swap(i as usize, j as usize);
-            let key_byte = state[(state[i as usize].wrapping_add(state[j as usize])) as usize];
-            *o_byte = i_byte ^ key_byte;
+            *o_byte = i_byte ^ keystream.next_byte();
+        }
+    }
+
+    /// The keystream from its start, to apply a piece at a time.
+    pub fn keystream(&self) -> Rc4Keystream {
+        Rc4Keystream {
+            state: self.initial_state,
+            i: 0,
+            j: 0,
         }
     }
 
@@ -62,5 +65,28 @@ impl Rc4 {
     {
         // Rc4 is symmetric
         self.decrypt(input)
+    }
+}
+
+/// An RC4 keystream, continued from one piece of data to the next.
+pub struct Rc4Keystream {
+    state: [u8; 256],
+    i: u8,
+    j: u8,
+}
+
+impl Rc4Keystream {
+    /// Encrypts or decrypts `data` in place.
+    pub fn apply(&mut self, data: &mut [u8]) {
+        for byte in data {
+            *byte ^= self.next_byte();
+        }
+    }
+
+    fn next_byte(&mut self) -> u8 {
+        self.i = self.i.wrapping_add(1);
+        self.j = self.j.wrapping_add(self.state[self.i as usize]);
+        self.state.swap(self.i as usize, self.j as usize);
+        self.state[(self.state[self.i as usize].wrapping_add(self.state[self.j as usize])) as usize]
     }
 }

@@ -2,6 +2,7 @@ mod algorithms;
 pub mod crypt_filters;
 mod pkcs5;
 mod rc4;
+pub(crate) mod stream_decryption;
 
 use crate::{Dictionary, Document, Error, Object, ObjectId};
 use bitflags::bitflags;
@@ -775,48 +776,14 @@ pub fn encrypt_object(state: &EncryptionState, obj_id: ObjectId, obj: &mut Objec
 
 /// Decrypts `obj`.
 pub fn decrypt_object(state: &EncryptionState, obj_id: ObjectId, obj: &mut Object) -> Result<(), DecryptionError> {
-    // The cross-reference stream shall not be encrypted and strings appearing in the
-    // cross-reference stream dictionary shall not be encrypted.
-    let is_xref_stream = obj
-        .as_stream()
-        .map(|stream| stream.dict.has_type(b"XRef"))
-        .unwrap_or(false);
-
-    if is_xref_stream {
-        return Ok(());
-    }
-
     // The Metadata stream shall only be encrypted if EncryptMetadata is set to true.
     if obj.type_name().ok() == Some(b"Metadata") && !state.encrypt_metadata {
         return Ok(());
     }
 
-    // A stream filter type, the Crypt filter can be specified for any stream in the document to
-    // override the default filter for streams. The stream's DecodeParms entry shall contain a
-    // Crypt filter decode parameters dictionary whose Name entry specifies the particular crypt
-    // filter that shell be used (if missing, Identity is used).
-    let override_crypt_filter = obj
-        .as_stream()
-        .ok()
-        .filter(|stream| {
-            stream
-                .filters()
-                .map(|filters| filters.contains(&&b"Crypt"[..]))
-                .unwrap_or(false)
-        })
-        .and_then(|stream| stream.dict.get(b"DecodeParms").ok())
-        .and_then(|object| object.as_dict().ok())
-        .map(|dict| {
-            dict.get(b"Name")
-                .and_then(|object| object.as_name())
-                .ok()
-                .and_then(|name| state.crypt_filters.get(name).cloned())
-                .unwrap_or(Arc::new(IdentityCryptFilter))
-        });
-
     // Retrieve the ciphertext and the crypt filter to use to decrypt the ciphertext from the given
     // object.
-    let (mut crypt_filter, ciphertext) = match obj {
+    let (crypt_filter, ciphertext) = match obj {
         // Encryption applies to all strings and streams in the document's PDF file, i.e., we have to
         // recursively process array and dictionary objects to decrypt any string and stream objects
         // stored inside of those.
@@ -837,18 +804,15 @@ pub fn decrypt_object(state: &EncryptionState, obj_id: ObjectId, obj: &mut Objec
         // Encryption applies to all strings and streams in the document's PDF file. We return the
         // crypt filter and the content here.
         Object::String(content, _) => (state.get_string_filter(), &*content),
-        Object::Stream(stream) => (state.get_stream_filter(), &stream.content),
+        Object::Stream(stream) => match stream_crypt_filter(state, &stream.dict) {
+            Some(crypt_filter) => (crypt_filter, &stream.content),
+            None => return Ok(()),
+        },
         // Encryption is not applied to other object types such as integers and boolean values.
         _ => {
             return Ok(());
         }
     };
-
-    // If the stream object specifies its own crypt filter, override the default one with the one
-    // from this stream object.
-    if let Some(filter) = override_crypt_filter {
-        crypt_filter = filter;
-    }
 
     // Compute the key from the original file encryption key and the object identifier to use for
     // the corresponding object.
@@ -865,6 +829,42 @@ pub fn decrypt_object(state: &EncryptionState, obj_id: ObjectId, obj: &mut Objec
     }
 
     Ok(())
+}
+
+/// The crypt filter that the content of a stream with dictionary `dict` is encrypted with, or
+/// `None` when it is stored unencrypted.
+pub(crate) fn stream_crypt_filter(state: &EncryptionState, dict: &Dictionary) -> Option<Arc<dyn CryptFilter>> {
+    // The cross-reference stream shall not be encrypted and strings appearing in the
+    // cross-reference stream dictionary shall not be encrypted.
+    if dict.has_type(b"XRef") {
+        return None;
+    }
+
+    // The Metadata stream shall only be encrypted if EncryptMetadata is set to true.
+    if dict.has_type(b"Metadata") && !state.encrypt_metadata {
+        return None;
+    }
+
+    // A stream filter type, the Crypt filter can be specified for any stream in the document to
+    // override the default filter for streams. The stream's DecodeParms entry shall contain a
+    // Crypt filter decode parameters dictionary whose Name entry specifies the particular crypt
+    // filter that shell be used (if missing, Identity is used).
+    let overrides = crate::object::filters_of(dict)
+        .map(|filters| filters.contains(&&b"Crypt"[..]))
+        .unwrap_or(false);
+    let override_crypt_filter = dict
+        .get(b"DecodeParms")
+        .ok()
+        .filter(|_| overrides)
+        .and_then(|object| object.as_dict().ok())
+        .map(|dict| {
+            dict.get(b"Name")
+                .and_then(|object| object.as_name())
+                .ok()
+                .and_then(|name| state.crypt_filters.get(name).cloned())
+                .unwrap_or(Arc::new(IdentityCryptFilter))
+        });
+    Some(override_crypt_filter.unwrap_or_else(|| state.get_stream_filter()))
 }
 
 #[cfg(test)]

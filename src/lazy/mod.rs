@@ -15,6 +15,7 @@
 mod document;
 mod single_page;
 mod source;
+mod stored_stream;
 
 pub use document::LazyDocument;
 pub use source::{FileSource, RandomAccessSource};

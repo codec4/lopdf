@@ -3,6 +3,7 @@ use crate::encodings::cmap::ToUnicodeCMap;
 use crate::encodings::{Differences, Encoding, Glyph};
 use crate::error::DecompressError;
 use crate::filters::flate::Inflater;
+use crate::stored_bytes::SliceBytes;
 use crate::{Document, Error, Result};
 use indexmap::IndexMap;
 use log::warn;
@@ -806,18 +807,7 @@ impl Stream {
     }
 
     pub fn filters(&self) -> Result<Vec<&[u8]>> {
-        let filter = self.dict.get(b"Filter")?;
-
-        if let Ok(name) = filter.as_name() {
-            Ok(vec![name])
-        } else if let Ok(names) = filter.as_array() {
-            names.iter().map(Object::as_name).collect()
-        } else {
-            Err(Error::ObjectType {
-                expected: "Name or Array",
-                found: filter.enum_variant(),
-            })
-        }
+        filters_of(&self.dict)
     }
 
     pub fn set_content(&mut self, content: Vec<u8>) {
@@ -919,22 +909,27 @@ impl Stream {
     /// variants. `limit` is `None` to decode without a size limit, or
     /// `Some(max)` to cap the decoded output at `max` bytes per filter layer.
     fn decode_filters(&self, limit: Option<usize>) -> Result<Vec<u8>> {
-        let params = self.decode_params();
-        let filters = match self.filters() {
+        Self::decode_stored(&self.dict, &self.content, limit)
+    }
+
+    /// [`Stream::decode_filters`] for the stored `content` of a stream with dictionary `dict`.
+    pub(crate) fn decode_stored(dict: &Dictionary, content: &[u8], limit: Option<usize>) -> Result<Vec<u8>> {
+        let params = Self::decode_params(dict);
+        let filters = match filters_of(dict) {
             Ok(f) => f,
             // No /Filter key means the stream is uncompressed. The raw content is
             // already in memory, but still honor the caller's limit.
             Err(_) => {
                 if let Some(max) = limit
-                    && self.content.len() > max
+                    && content.len() > max
                 {
                     return Err(DecompressError::MemoryLimitExceeded { limit: max }.into());
                 }
-                return Ok(self.content.clone());
+                return Ok(content.to_vec());
             }
         };
 
-        let mut input = self.content.as_slice();
+        let mut input = content;
         let mut output = vec![];
 
         // Filters are in decoding order.
@@ -1057,7 +1052,8 @@ impl Stream {
             None => input.len().saturating_mul(2),
         };
         let mut output = Vec::with_capacity(initial_capacity);
-        Inflater::new(input).read_into(&mut output, limit.map_or(usize::MAX, |max| max.saturating_add(1)));
+        Inflater::new(SliceBytes::new(input))
+            .read_into(&mut output, limit.map_or(usize::MAX, |max| max.saturating_add(1)))?;
         if let Some(max) = limit
             && output.len() > max
         {
@@ -1197,15 +1193,16 @@ impl Stream {
         Ok(output)
     }
 
-    /// Whether the content decodes by inflating alone, which [`Inflater`] does a piece at a time.
-    pub(crate) fn inflates_alone(&self) -> bool {
-        let predictor = Self::predictor(self.decode_params());
-        matches!(self.filters().as_deref(), Ok([filter]) if *filter == b"FlateDecode")
+    /// Whether the content of a stream with dictionary `dict` decodes by inflating alone, which
+    /// [`Inflater`] does a piece at a time.
+    pub(crate) fn inflates_alone(dict: &Dictionary) -> bool {
+        let predictor = Self::predictor(Self::decode_params(dict));
+        matches!(filters_of(dict).as_deref(), Ok([filter]) if *filter == b"FlateDecode")
             && !(predictor == 2 || (10..=15).contains(&predictor))
     }
 
-    fn decode_params(&self) -> Option<&Dictionary> {
-        self.dict.get(b"DecodeParms").and_then(Object::as_dict).ok()
+    fn decode_params(dict: &Dictionary) -> Option<&Dictionary> {
+        dict.get(b"DecodeParms").and_then(Object::as_dict).ok()
     }
 
     fn predictor(params: Option<&Dictionary>) -> i64 {
@@ -1354,6 +1351,22 @@ impl Stream {
 
     pub fn is_compressed(&self) -> bool {
         self.dict.get(b"Filter").is_ok()
+    }
+}
+
+/// The filters of a stream with dictionary `dict`, in decoding order.
+pub(crate) fn filters_of(dict: &Dictionary) -> Result<Vec<&[u8]>> {
+    let filter = dict.get(b"Filter")?;
+
+    if let Ok(name) = filter.as_name() {
+        Ok(vec![name])
+    } else if let Ok(names) = filter.as_array() {
+        names.iter().map(Object::as_name).collect()
+    } else {
+        Err(Error::ObjectType {
+            expected: "Name or Array",
+            found: filter.enum_variant(),
+        })
     }
 }
 

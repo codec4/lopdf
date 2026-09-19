@@ -625,7 +625,7 @@ impl Document {
     }
 
     fn read_page_content(&self, page_id: ObjectId, limits: DecodeLimits) -> Result<Vec<u8>> {
-        let mut content = PageContent::new(self, page_id, limits);
+        let mut content = PageContent::new(self, self.get_page_contents(page_id), limits, 0);
         let mut output = Vec::new();
         while content.read_into(&mut output)? {}
         Ok(output)

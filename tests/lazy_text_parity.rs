@@ -3,9 +3,14 @@
 
 #![cfg(feature = "lazy-reader")]
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use lopdf::content::{Content, Operation};
-use lopdf::lazy::LazyDocument;
-use lopdf::xref::XrefType;
+use lopdf::encryption::crypt_filters::{Aes128CryptFilter, Aes256CryptFilter, CryptFilter};
+use lopdf::lazy::{LazyDocument, RandomAccessSource};
+use lopdf::xref::{XrefEntry, XrefType};
 use lopdf::{
     DecodeLimits, Dictionary, Document, EncryptionState, EncryptionVersion, LoadOptions, Object, ObjectId, Permissions,
     SaveOptions, Stream, StringFormat, dictionary,
@@ -27,7 +32,16 @@ fn every_page_matches_the_eager_extractor() {
             save(&mut fixture.document.clone(), object_streams, xref_streams),
         ));
     }
-    sources.push(("encrypted".to_owned(), encrypted(fixture.document.clone())));
+    for (label, version) in [
+        ("RC4", Cipher::Rc4),
+        ("AES-128", Cipher::Aes128),
+        ("AES-256", Cipher::Aes256),
+    ] {
+        sources.push((
+            format!("encrypted with {label}"),
+            encrypted(fixture.document.clone(), version),
+        ));
+    }
     for asset in [
         "example.pdf",
         "Incremental.pdf",
@@ -62,22 +76,106 @@ fn every_page_matches_the_eager_extractor() {
     assert!(text(fixture.pages[3]).contains("indirect"));
 }
 
+/// Page text reads the page, its ancestors, fonts, and content, and nothing else: no font
+/// program, no image, no other page. Content streams are read from the source a chunk at a time,
+/// so no read is large even for a page with megabytes of content.
 #[test]
-fn a_single_page_document_leaves_out_font_programs_images_and_other_pages() {
+fn page_text_reads_only_what_it_needs_and_never_a_large_block() {
+    let mut fixture = Fixture::build();
+    let first = fixture.pages[0];
+    // Hex digits from xorshift, which deflate to about half their size.
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let noise: String = (0..3_000_000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            char::from(b"0123456789abcdef"[(state >> 60) as usize])
+        })
+        .collect();
+    let mut stream = Stream::new(dictionary! {}, format!("BT /F1 12 Tf <{noise}> Tj ET").into_bytes());
+    stream.compress().unwrap();
+    let large = fixture.document.add_object(stream);
+    let contents = fixture
+        .document
+        .get_dictionary_mut(first)
+        .unwrap()
+        .get_mut(b"Contents")
+        .unwrap();
+    contents.as_array_mut().unwrap().push(Object::Reference(large));
+    let bytes = save(&mut fixture.document, false, false);
+    let file_len = bytes.len() as u64;
+    let source = RecordingSource::new(bytes);
+    let lazy = LazyDocument::from_source(&source, LoadOptions::default()).unwrap();
+    let forbidden: Vec<(u64, u64)> = [fixture.font_program, fixture.image]
+        .iter()
+        .chain(&fixture.pages[1..])
+        .map(|id| object_range(&lazy, *id, file_len))
+        .collect();
+    let (large_start, large_end) = object_range(&lazy, large, file_len);
+    assert!(large_end - large_start > 1_000_000, "{}", large_end - large_start);
+    source.reads.borrow_mut().clear();
+
+    let text = lazy
+        .extract_page_text_with_limits(first, DecodeLimits::uniform(LIMIT))
+        .unwrap();
+
+    assert!(text.contains("Hello") && text.contains("BAAB"), "{text:?}");
+    let reads = source.reads.borrow();
+    for &(offset, len) in reads.iter() {
+        assert!(len <= 64 * 1024, "a read of {len} bytes at {offset}");
+        for &(start, end) in &forbidden {
+            assert!(
+                !(start..end).contains(&offset),
+                "read at {offset} inside an object at {start}..{end}"
+            );
+        }
+    }
+    assert!(
+        reads
+            .iter()
+            .any(|&(offset, _)| (large_start..large_end).contains(&offset))
+    );
+}
+
+/// The pages of one call share the total bound, as in the eager extractor.
+#[test]
+fn the_pages_of_one_call_share_the_total_bound() {
     let fixture = Fixture::build();
-    let bytes = save(&mut fixture.document.clone(), false, false);
+    let bytes = save(&mut fixture.document.clone(), true, true);
+    let eager = Document::load_mem(&bytes).unwrap();
+    let lens: Vec<usize> = fixture
+        .pages
+        .iter()
+        .map(|id| eager.get_page_content(*id).len())
+        .collect();
+    let limits = DecodeLimits {
+        max_total_content_size: lens[0] + lens[1],
+        ..DecodeLimits::uniform(LIMIT)
+    };
     let lazy = LazyDocument::from_source(bytes.as_slice(), LoadOptions::default()).unwrap();
 
-    let first = lazy.single_page_document(fixture.pages[0]).unwrap();
-    assert_eq!(first.get_pages().len(), 1);
-    assert!(!first.objects.contains_key(&fixture.font_program));
-    assert!(!first.objects.contains_key(&fixture.image));
-    for other in &fixture.pages[1..] {
-        assert!(!first.objects.contains_key(other));
-    }
+    let texts: Vec<_> = lazy
+        .extract_pages_text_with_limits(fixture.pages.clone(), limits)
+        .collect();
 
-    let image_page = lazy.single_page_document(fixture.pages[2]).unwrap();
-    assert!(!image_page.objects.contains_key(&fixture.image));
+    assert!(texts[0].is_ok() && texts[1].is_ok());
+    for text in &texts[2..] {
+        assert!(matches!(
+            text,
+            Err(lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded { limit }))
+                if *limit == lens[0] + lens[1]
+        ));
+    }
+    assert_eq!(
+        format!("{:?}", eager.extract_text_with_limits(&[1, 2, 3], limits)),
+        format!(
+            "{:?}",
+            Err::<String, _>(lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded {
+                limit: lens[0] + lens[1]
+            }))
+        )
+    );
 }
 
 #[test]
@@ -280,8 +378,14 @@ fn save(doc: &mut Document, object_streams: bool, xref_streams: bool) -> Vec<u8>
     bytes
 }
 
+enum Cipher {
+    Rc4,
+    Aes128,
+    Aes256,
+}
+
 /// The document encrypted with an empty user password, which both readers open.
-fn encrypted(mut doc: Document) -> Vec<u8> {
+fn encrypted(mut doc: Document, cipher: Cipher) -> Vec<u8> {
     doc.trailer.set(
         "ID",
         Object::Array(vec![
@@ -289,14 +393,87 @@ fn encrypted(mut doc: Document) -> Vec<u8> {
             Object::String(b"text-parity-id-2".to_vec(), StringFormat::Literal),
         ]),
     );
-    let state = EncryptionState::try_from(EncryptionVersion::V2 {
-        document: &doc,
-        owner_password: "owner",
-        user_password: "",
-        key_length: 128,
-        permissions: Permissions::all(),
-    })
-    .unwrap();
+    let aes = |filter: Arc<dyn CryptFilter>| BTreeMap::from([(b"StdCF".to_vec(), filter)]);
+    let version = match cipher {
+        Cipher::Rc4 => EncryptionVersion::V2 {
+            document: &doc,
+            owner_password: "owner",
+            user_password: "",
+            key_length: 128,
+            permissions: Permissions::all(),
+        },
+        Cipher::Aes128 => EncryptionVersion::V4 {
+            document: &doc,
+            encrypt_metadata: true,
+            crypt_filters: aes(Arc::new(Aes128CryptFilter)),
+            stream_filter: b"StdCF".to_vec(),
+            string_filter: b"StdCF".to_vec(),
+            owner_password: "owner",
+            user_password: "",
+            permissions: Permissions::all(),
+        },
+        Cipher::Aes256 => EncryptionVersion::V5 {
+            encrypt_metadata: true,
+            crypt_filters: aes(Arc::new(Aes256CryptFilter)),
+            file_encryption_key: &[7; 32],
+            stream_filter: b"StdCF".to_vec(),
+            string_filter: b"StdCF".to_vec(),
+            owner_password: "owner",
+            user_password: "",
+            permissions: Permissions::all(),
+        },
+    };
+    let state = EncryptionState::try_from(version).unwrap();
     doc.encrypt(&state).unwrap();
     save(&mut doc, false, false)
+}
+
+/// Where object `id` lies in a source of `len` bytes: from its offset to the next object's.
+fn object_range<S: RandomAccessSource>(lazy: &LazyDocument<S>, id: ObjectId, len: u64) -> (u64, u64) {
+    let offsets: Vec<u64> = lazy
+        .reference_table()
+        .entries
+        .values()
+        .filter_map(|entry| match entry {
+            XrefEntry::Normal { offset, .. } => Some(u64::from(*offset)),
+            _ => None,
+        })
+        .collect();
+    let Some(XrefEntry::Normal { offset, .. }) = lazy.reference_table().get(id.0) else {
+        panic!("object {id:?} is not stored on its own");
+    };
+    let start = u64::from(*offset);
+    let end = offsets
+        .iter()
+        .copied()
+        .filter(|&next| next > start)
+        .min()
+        .unwrap_or(len);
+    (start, end)
+}
+
+/// A source that records every read.
+struct RecordingSource {
+    bytes: Vec<u8>,
+    reads: RefCell<Vec<(u64, usize)>>,
+}
+
+impl RecordingSource {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            reads: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl RandomAccessSource for RecordingSource {
+    fn len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        self.reads.borrow_mut().push((offset, buf.len()));
+        self.bytes.read_exact_at(offset, buf)
+    }
 }

@@ -24,7 +24,7 @@ const TAIL_LEN: usize = 1024;
 /// The first window read for a cross-reference section. It grows until the section parses.
 const XREF_WINDOW: usize = 64 * 1024;
 /// The smallest window read for an object, so that most objects cost one read.
-const MIN_OBJECT_WINDOW: usize = 4 * 1024;
+pub(super) const MIN_OBJECT_WINDOW: usize = 4 * 1024;
 /// The largest window read for one cross-reference section or one object.
 const MAX_WINDOW: usize = 64 * 1024 * 1024;
 /// Room after an offset for an indirect-object header when correcting an xref offset.
@@ -44,7 +44,7 @@ const OBJECT_STREAM_CACHE_BYTES: usize = 1024 * 1024;
 /// Deepest `/Pages` nesting followed, as in [`Document::get_pages`].
 const PAGE_TREE_DEPTH_LIMIT: usize = 256;
 /// Longest chain of references followed to reach an object, as in [`Document::get_object`].
-const DEREF_LIMIT: usize = 128;
+pub(super) const DEREF_LIMIT: usize = 128;
 
 /// A PDF read from a [`RandomAccessSource`] one object at a time. See the [module docs](super).
 ///
@@ -54,17 +54,17 @@ pub struct LazyDocument<S> {
     /// Where `%PDF-` starts in the source. Offsets inside the PDF count from here.
     base: u64,
     /// Length of the PDF from `base`.
-    len: usize,
+    pub(super) len: usize,
     version: String,
     trailer: Dictionary,
     reference_table: Xref,
     /// Sorted, unique offsets of in-use objects, which bound each object's bytes.
-    normal_offsets: Vec<usize>,
+    pub(super) normal_offsets: Vec<usize>,
     xref_start: usize,
     strict: bool,
     max_decompressed_size: Option<usize>,
-    encryption_state: Option<EncryptionState>,
-    encryption_dictionary: Option<ObjectId>,
+    pub(super) encryption_state: Option<EncryptionState>,
+    pub(super) encryption_dictionary: Option<ObjectId>,
     objects: RefCell<FifoCache<ObjectId, Object>>,
     object_streams: RefCell<FifoCache<u32, Rc<ObjectStreamIndex>>>,
 }
@@ -314,7 +314,12 @@ impl<S: RandomAccessSource> LazyDocument<S> {
 
     /// Reads object `id` without following an object that is itself a reference, as the eager
     /// reader does while loading. `already_seen` guards reference cycles.
-    fn resolve(&self, id: ObjectId, already_seen: &mut HashSet<ObjectId>) -> Result<Object> {
+    /// Object `id` when it is among the objects kept after reading.
+    pub(super) fn cached(&self, id: ObjectId) -> Option<Object> {
+        self.objects.borrow().get(&id)
+    }
+
+    pub(super) fn resolve(&self, id: ObjectId, already_seen: &mut HashSet<ObjectId>) -> Result<Object> {
         if !already_seen.insert(id) {
             warn!("reference cycle detected resolving object {} {}", id.0, id.1);
             return Err(Error::ReferenceCycle(id));
@@ -412,7 +417,7 @@ impl<S: RandomAccessSource> LazyDocument<S> {
         }
     }
 
-    fn object_end(&self, offset: usize, next_object: Option<usize>) -> usize {
+    pub(super) fn object_end(&self, offset: usize, next_object: Option<usize>) -> usize {
         let xref_start = (self.xref_start > offset).then_some(self.xref_start);
         next_object
             .into_iter()
@@ -545,7 +550,7 @@ impl<S: RandomAccessSource> LazyDocument<S> {
     }
 
     /// Reads bytes `start..end` of the PDF, counted from its `%PDF-` header.
-    fn read(&self, start: usize, end: usize) -> Result<Vec<u8>> {
+    pub(super) fn read(&self, start: usize, end: usize) -> Result<Vec<u8>> {
         let mut bytes = vec![0; end.saturating_sub(start)];
         self.source.read_exact_at(self.base + start as u64, &mut bytes)?;
         Ok(bytes)

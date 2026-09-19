@@ -1,45 +1,63 @@
 //! Page text through the eager extractor, one page at a time.
 //!
-//! [`Document::extract_text_with_limit`] reads a page's fonts, their encodings and `/ToUnicode`
-//! CMaps, the resources inherited through the page tree, and the content streams, all from
-//! [`Document::objects`]. [`LazyDocument::single_page_document`] copies exactly those objects,
-//! with their ids, into a document of one page, so the eager extractor runs unchanged and a
-//! page's objects are dropped once its text is out.
+//! [`Document`]'s text extraction reads a page's fonts, their encodings and `/ToUnicode` CMaps,
+//! and the resources inherited through the page tree from [`Document::objects`].
+//! [`LazyDocument::page_text_document`] copies exactly those objects, with their ids, into a
+//! document of one page, so the eager extractor runs unchanged, and a page's objects are dropped
+//! once its text is out. The content streams stay in the source, which the extractor reads a chunk
+//! at a time as it parses them.
 
 use std::collections::HashSet;
 
 use super::LazyDocument;
 use super::source::RandomAccessSource;
+use crate::page_content::PageContent;
 use crate::resolver::skip_unless_io;
-use crate::{DecodeLimits, Dictionary, Document, Object, ObjectId, Result, dictionary};
+use crate::{DecodeLimits, Dictionary, Document, Object, ObjectId, Result};
 
 /// Font entries that text extraction never reads and that can hold large streams: embedded font
 /// programs, Type 3 glyph procedures, and Type 3 resources.
 const SKIPPED_FONT_KEYS: &[&[u8]] = &[b"FontFile", b"FontFile2", b"FontFile3", b"CharProcs", b"Resources"];
 
 impl<S: RandomAccessSource> LazyDocument<S> {
-    /// A document of the single page `page_id`, holding what text extraction reads: the page, its
-    /// ancestors in the page tree, their `/Resources` down to the fonts, each font with its
-    /// encoding and `/ToUnicode` CMap, and the content streams. Objects keep their ids; entries
-    /// that extraction never follows, such as images, stay as references to objects that are
-    /// not copied.
-    pub fn single_page_document(&self, page_id: ObjectId) -> Result<Document> {
+    /// The text of page `page_id`, as [`Document::extract_text_with_limits`] extracts it from the
+    /// whole document.
+    pub fn extract_page_text_with_limits(&self, page_id: ObjectId, limits: DecodeLimits) -> Result<String> {
+        self.extract_pages_text_with_limits([page_id], limits)
+            .next()
+            .expect("one page")
+    }
+
+    /// The text of each of `page_ids` in turn, as [`Document::extract_text_with_limits`] extracts
+    /// it from the whole document. The pages share [`DecodeLimits::max_total_content_size`].
+    ///
+    /// Memory does not grow with a page's content: each content stream is read from the source a
+    /// chunk at a time, decrypted and inflated on the way, and parsed one operation at a time.
+    pub fn extract_pages_text_with_limits<'a>(
+        &'a self, page_ids: impl IntoIterator<Item = ObjectId> + 'a, limits: DecodeLimits,
+    ) -> impl Iterator<Item = Result<String>> + 'a {
+        // Content decoded by the pages read so far, against the total limit.
+        let mut spent = 0;
+        page_ids.into_iter().map(move |page_id| {
+            let document = self.page_text_document(page_id)?;
+            let mut content = PageContent::new(self, self.page_content_ids(page_id)?, limits, spent);
+            let chunks = document.page_text_chunks(page_id, Some(limits), &mut content);
+            spent += content.len();
+            chunks?.into_iter().collect()
+        })
+    }
+
+    /// A document of the single page `page_id`, holding what text extraction reads besides the
+    /// content: the page, its ancestors in the page tree, their `/Resources` down to the fonts,
+    /// and each font with its encoding and `/ToUnicode` CMap. Objects keep their ids; entries that
+    /// extraction never follows, such as images and the content streams, stay as references to
+    /// objects that are not copied.
+    pub(crate) fn page_text_document(&self, page_id: ObjectId) -> Result<Document> {
         let mut document = Document::with_version(self.version());
-        // New objects take numbers past every object of the file, so that they cannot stand in
-        // for an object that was not copied.
-        let highest = self.reference_table().entries.keys().next_back().copied().unwrap_or(0);
-        document.max_id = highest.max(self.reference_table().size.saturating_sub(1));
         let mut copied = HashSet::new();
 
-        let page = self.copy_object(&mut document, &mut copied, page_id)?;
-        if let Some(Object::Dictionary(page)) = &page
-            && let Ok(contents) = page.get(b"Contents")
-        {
-            self.copy_closure(&mut document, &mut copied, contents.clone(), &[])?;
-        }
-
         // The page and its ancestors, as far as the eager resource lookup walks them.
-        let mut node = page;
+        let mut node = self.copy_object(&mut document, &mut copied, page_id)?;
         let mut ancestors = 0;
         while let Some(Object::Dictionary(dictionary)) = node.take() {
             self.copy_fonts(&mut document, &mut copied, &dictionary)?;
@@ -52,27 +70,7 @@ impl<S: RandomAccessSource> LazyDocument<S> {
             ancestors += 1;
             node = self.copy_object(&mut document, &mut copied, parent)?;
         }
-
-        // A root of its own, so that the page tree holds only this page.
-        let root_id = document.new_object_id();
-        document.objects.insert(
-            root_id,
-            Object::Dictionary(dictionary! {
-                "Type" => "Pages",
-                "Kids" => vec![Object::Reference(page_id)],
-                "Count" => 1,
-            }),
-        );
-        let catalog_id = document.add_object(dictionary! { "Type" => "Catalog", "Pages" => root_id });
-        document.trailer.set("Root", catalog_id);
         Ok(document)
-    }
-
-    /// The text of page `page_id`, as [`Document::extract_text_with_limits`] extracts it from the
-    /// whole document.
-    pub fn extract_page_text_with_limits(&self, page_id: ObjectId, limits: DecodeLimits) -> Result<String> {
-        self.single_page_document(page_id)?
-            .extract_text_with_limits(&[1], limits)
     }
 
     /// Copies the fonts of the `/Resources` of a page-tree node: the resources object when it is

@@ -541,6 +541,47 @@ fn _indirect_object<'a>(
     Ok((object_id, object))
 }
 
+/// What the start of an indirect object tells about whether it is a stream.
+pub(crate) enum ObjectHead {
+    /// A stream: its dictionary, and where its content starts in the input.
+    Stream(Dictionary, usize),
+    /// Not a stream, or not one this reads without its content.
+    NotStream,
+    /// The input ends too soon to tell.
+    Truncated,
+}
+
+/// Reads the start of the indirect object `expected_id` at the start of `input` as
+/// [`indirect_object`] reads a stream, without its content.
+pub(crate) fn indirect_object_head(input: ParserInput, expected_id: ObjectId) -> ObjectHead {
+    let Ok((i, (_, object_id))) = terminated((space, object_id), pair(tag(&b"obj"[..]), space)).parse(input) else {
+        return ObjectHead::Truncated;
+    };
+    if object_id != expected_id {
+        return ObjectHead::NotStream;
+    }
+    if !i.starts_with(b"<<") {
+        return if i.len() < 2 {
+            ObjectHead::Truncated
+        } else {
+            ObjectHead::NotStream
+        };
+    }
+    match terminated(dictionary, (space, tag(&b"stream"[..]), space0, eol)).parse(i) {
+        Ok((rest, dict)) => ObjectHead::Stream(dict, input.len() - rest.len()),
+        // A whole dictionary with room after it for the stream keyword is not a stream.
+        Err(_) => match dictionary(i) {
+            Ok((rest, _)) if rest.len() >= 16 => ObjectHead::NotStream,
+            _ => ObjectHead::Truncated,
+        },
+    }
+}
+
+/// Whether `input` starts where a stream's content ends, as [`indirect_object`] expects.
+pub(crate) fn is_stream_end(input: ParserInput) -> bool {
+    pair(opt(eol), tag(&b"endstream"[..])).parse(input).is_ok()
+}
+
 pub fn header(input: ParserInput, strict: bool) -> Option<String> {
     // Parse version digits (e.g. "1.7") separately from any trailing bytes
     // before the newline.  Some PDF generators (e.g. ImageMill) place binary

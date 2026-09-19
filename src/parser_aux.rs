@@ -67,9 +67,9 @@ impl Document {
         self.extract_text_with_limits(page_numbers, DecodeLimits::uniform(max_decompressed_size))
     }
 
-    /// [`Document::extract_text_with_limit`] with separate bounds on each stream held whole and
-    /// on each page's content. Content is parsed as it decodes, so a page's content can be allowed
-    /// far more than a stream that is held whole.
+    /// [`Document::extract_text_with_limit`] with separate bounds on each stream held whole, on
+    /// each page's content, and on the content of all the pages together. Content is parsed as it
+    /// decodes, so a page's content can be allowed far more than a stream that is held whole.
     pub fn extract_text_with_limits(&self, page_numbers: &[u32], limits: DecodeLimits) -> Result<String> {
         self.extract_text_inner(page_numbers, Some(limits))
     }
@@ -99,12 +99,33 @@ impl Document {
         self.extract_text_chunks_inner(page_numbers, Some(DecodeLimits::uniform(max_decompressed_size)))
     }
 
+    /// [`Document::extract_text_chunks_with_limit`] with separate bounds on each stream held whole,
+    /// on each page's content, and on the content of all the pages together.
+    pub fn extract_text_chunks_with_limits(&self, page_numbers: &[u32], limits: DecodeLimits) -> Vec<Result<String>> {
+        self.extract_text_chunks_inner(page_numbers, Some(limits))
+    }
+
     fn extract_text_chunks_inner(&self, page_numbers: &[u32], limits: Option<DecodeLimits>) -> Vec<Result<String>> {
         let pages: BTreeMap<u32, (u32, u16)> = self.get_pages();
+        // Content decoded by the pages read so far, against the total limit.
+        let mut spent = 0;
         page_numbers
             .iter()
             .flat_map(|page_number| {
-                let result = self.extract_text_chunks_from_page(&pages, *page_number, limits);
+                let result = pages
+                    .get(page_number)
+                    .ok_or(Error::PageNumberNotFound(*page_number))
+                    .and_then(|&page_id| {
+                        let mut content = PageContent::new(
+                            self,
+                            self.get_page_contents(page_id),
+                            limits.unwrap_or(DecodeLimits::UNBOUNDED),
+                            spent,
+                        );
+                        let result = self.page_text_chunks(page_id, limits, &mut content);
+                        spent += content.len();
+                        result
+                    });
                 match result {
                     Ok(text_chunks) => text_chunks,
                     Err(err) => vec![Err(err)],
@@ -113,12 +134,12 @@ impl Document {
             .collect()
     }
 
-    fn extract_text_chunks_from_page(
-        &self, pages: &BTreeMap<u32, (u32, u16)>, page_number: u32, limits: Option<DecodeLimits>,
+    /// The text of page `page_id` whose content `content` reads, in one chunk per font.
+    pub(crate) fn page_text_chunks(
+        &self, page_id: ObjectId, limits: Option<DecodeLimits>, content: &mut PageContent,
     ) -> Result<Vec<Result<String>>> {
         let mut collected_chunks_and_errs: Vec<std::result::Result<String, Error>> = Vec::new();
 
-        let page_id = *pages.get(&page_number).ok_or(Error::PageNumberNotFound(page_number))?;
         let fonts = self.get_page_fonts(page_id)?;
         let encodings: BTreeMap<Vec<u8>, Encoding> = fonts
             .into_iter()
@@ -137,12 +158,9 @@ impl Document {
             })
             .collect();
         // The content is parsed as it decodes, so that a page never holds all its operations.
-        let limits = limits.unwrap_or(DecodeLimits::UNBOUNDED);
-        let mut content = PageContent::new(self, page_id, limits);
-        let operations = parser::ChunkedContentOperations::new(
-            |buffer: &mut Vec<u8>| content.read_into(buffer),
-            limits.max_stream_size,
-        );
+        let max_operation_size = limits.map_or(usize::MAX, |limits| limits.max_stream_size);
+        let operations =
+            parser::ChunkedContentOperations::new(|buffer: &mut Vec<u8>| content.read_into(buffer), max_operation_size);
 
         // each text with different encoding is extracted as separate chunk
         let mut current_encoding = None;
@@ -876,6 +894,7 @@ mod tests {
         let limits = DecodeLimits {
             max_stream_size: BOMB_MIB,
             max_page_content_size: 16 * BOMB_MIB,
+            max_total_content_size: usize::MAX,
         };
         let limit_of = |result: crate::Result<String>| match result {
             Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) => limit,
@@ -917,6 +936,36 @@ mod tests {
 
         let doc = doc_with_tounicode_font_bomb(32 * BOMB_MIB);
         assert_eq!(limit_of(doc.extract_text_with_limits(&[1], limits)), BOMB_MIB);
+    }
+
+    /// The pages of one call share the total bound: a page that would go past it fails, reporting
+    /// the total, while the pages before it read in full.
+    #[test]
+    fn extract_text_with_limits_bounds_the_content_of_all_pages_together() {
+        use crate::{DecodeLimits, DecompressError, Error};
+
+        let doc = create_document_with_texts(&["one", "two", "three"]);
+        let lens: Vec<usize> = (1..=3)
+            .map(|n| doc.get_page_content(doc.get_pages()[&n]).len())
+            .collect();
+        let limits = DecodeLimits {
+            max_total_content_size: lens[0] + lens[1],
+            ..DecodeLimits::uniform(usize::MAX)
+        };
+
+        let chunks = doc.extract_text_chunks_with_limits(&[1, 2, 3], limits);
+
+        let text: String = chunks.iter().filter_map(|chunk| chunk.as_ref().ok().cloned()).collect();
+        assert!(
+            text.contains("one") && text.contains("two") && !text.contains("three"),
+            "{text:?}"
+        );
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) if *limit == lens[0] + lens[1]
+        )));
+        assert!(doc.extract_text_with_limits(&[1, 2], limits).is_ok());
+        assert!(doc.extract_text_with_limits(&[3, 1, 2], limits).is_err());
     }
 
     #[test]
