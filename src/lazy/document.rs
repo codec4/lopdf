@@ -14,10 +14,10 @@ use crate::encryption::{self, EncryptionState};
 use crate::error::{ParseError, XrefError};
 use crate::object_stream::ObjectStreamIndex;
 use crate::parser::{self, ParseContext};
-use crate::reader::XREF_OFFSET_RECOVERY_WINDOW;
+use crate::reader::{InfoMetadata, XREF_OFFSET_RECOVERY_WINDOW};
 use crate::resolver::{ObjectResolver, skip_unless_io};
 use crate::xref::{Xref, XrefEntry, XrefType};
-use crate::{Dictionary, Document, Error, LoadOptions, Object, ObjectId, Reader, Result};
+use crate::{Dictionary, Document, Error, LoadOptions, Object, ObjectId, PdfMetadata, Reader, Result};
 
 /// How much of the end of the source is searched for `startxref`.
 const TAIL_LEN: usize = 1024;
@@ -244,6 +244,31 @@ impl<S: RandomAccessSource> LazyDocument<S> {
     /// The number of pages [`Self::get_pages`] finds.
     pub fn page_count(&self) -> Result<u32> {
         Ok(self.get_pages()?.len() as u32)
+    }
+
+    /// The `/Info` strings, the page count, the version, and whether the file is encrypted, as
+    /// [`Document::load_metadata`] reports them, without reading the whole file. The page count
+    /// is the number of pages the page tree holds, as in pdfium, rather than the root's `/Count`.
+    pub fn metadata(&self) -> Result<PdfMetadata> {
+        let info = skip_unless_io(self.trailer.get(b"Info").and_then(|info| self.dereference(info)))?;
+        let info = match info.as_ref().map(Object::as_dict) {
+            Some(Ok(dictionary)) => InfoMetadata::from_dictionary(dictionary),
+            _ => InfoMetadata::empty(),
+        };
+        Ok(PdfMetadata {
+            title: info.title,
+            author: info.author,
+            subject: info.subject,
+            keywords: info.keywords,
+            creator: info.creator,
+            producer: info.producer,
+            creation_date: info.creation_date,
+            modification_date: info.modification_date,
+            custom: info.custom,
+            page_count: self.page_count()?,
+            version: self.version.clone(),
+            encrypted: self.is_encrypted(),
+        })
     }
 
     /// The `/Kids` of page tree node `id`, or none when the node or its kids cannot be read.

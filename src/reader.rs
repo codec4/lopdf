@@ -542,20 +542,20 @@ pub struct PdfMetadata {
     pub encrypted: bool,
 }
 
-struct InfoMetadata {
-    title: Option<String>,
-    author: Option<String>,
-    subject: Option<String>,
-    keywords: Option<String>,
-    creator: Option<String>,
-    producer: Option<String>,
-    creation_date: Option<String>,
-    modification_date: Option<String>,
-    custom: HashMap<Vec<u8>, Object>,
+pub(crate) struct InfoMetadata {
+    pub(crate) title: Option<String>,
+    pub(crate) author: Option<String>,
+    pub(crate) subject: Option<String>,
+    pub(crate) keywords: Option<String>,
+    pub(crate) creator: Option<String>,
+    pub(crate) producer: Option<String>,
+    pub(crate) creation_date: Option<String>,
+    pub(crate) modification_date: Option<String>,
+    pub(crate) custom: HashMap<Vec<u8>, Object>,
 }
 
 impl InfoMetadata {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             title: None,
             author: None,
@@ -566,6 +566,29 @@ impl InfoMetadata {
             creation_date: None,
             modification_date: None,
             custom: HashMap::new(),
+        }
+    }
+
+    /// The standard fields of an `/Info` dictionary, with its other entries kept in `custom`.
+    pub(crate) fn from_dictionary(info_dict: &Dictionary) -> Self {
+        let mut custom = HashMap::new();
+        for (key, value) in info_dict.iter() {
+            if STANDARD_INFO_KEYS.contains(&key.as_slice()) {
+                continue;
+            }
+            custom.insert(key.clone(), value.clone());
+        }
+
+        Self {
+            title: Reader::extract_string_field(info_dict, b"Title"),
+            author: Reader::extract_string_field(info_dict, b"Author"),
+            subject: Reader::extract_string_field(info_dict, b"Subject"),
+            keywords: Reader::extract_string_field(info_dict, b"Keywords"),
+            creator: Reader::extract_string_field(info_dict, b"Creator"),
+            producer: Reader::extract_string_field(info_dict, b"Producer"),
+            creation_date: Reader::extract_string_field(info_dict, b"CreationDate"),
+            modification_date: Reader::extract_string_field(info_dict, b"ModDate"),
+            custom,
         }
     }
 }
@@ -687,25 +710,7 @@ impl Reader<'_> {
             Err(_) => return Ok(InfoMetadata::empty()),
         };
 
-        let mut custom = HashMap::new();
-        for (key, value) in info_dict.iter() {
-            if STANDARD_INFO_KEYS.contains(&key.as_slice()) {
-                continue;
-            }
-            custom.insert(key.clone(), value.clone());
-        }
-
-        Ok(InfoMetadata {
-            title: Self::extract_string_field(info_dict, b"Title"),
-            author: Self::extract_string_field(info_dict, b"Author"),
-            subject: Self::extract_string_field(info_dict, b"Subject"),
-            keywords: Self::extract_string_field(info_dict, b"Keywords"),
-            creator: Self::extract_string_field(info_dict, b"Creator"),
-            producer: Self::extract_string_field(info_dict, b"Producer"),
-            creation_date: Self::extract_string_field(info_dict, b"CreationDate"),
-            modification_date: Self::extract_string_field(info_dict, b"ModDate"),
-            custom,
-        })
+        Ok(InfoMetadata::from_dictionary(info_dict))
     }
 
     fn extract_string_field(dict: &Dictionary, key: &[u8]) -> Option<String> {

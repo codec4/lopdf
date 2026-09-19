@@ -30,6 +30,69 @@ fn every_asset_matches_the_eager_reader() {
 }
 
 #[test]
+fn metadata_matches_the_eager_metadata_loader() {
+    let mut sources: Vec<(String, Vec<u8>)> = [
+        "example.pdf",
+        "Incremental.pdf",
+        "AnnotationDemo.pdf",
+        "test.pdf",
+        "unicode.pdf",
+        "encrypted.pdf",
+    ]
+    .into_iter()
+    .map(|asset| (asset.to_owned(), std::fs::read(format!("assets/{asset}")).unwrap()))
+    .collect();
+    let mut doc = sample_document(4);
+    let info = doc.add_object(dictionary! {
+        "Title" => Object::String(b"\xFE\xFF\x00C\x00a\x00f\x00\xE9".to_vec(), StringFormat::Hexadecimal),
+        "Author" => Object::string_literal("Ann Author"),
+        "Custom" => 7,
+    });
+    doc.trailer.set("Info", info);
+    for (object_streams, xref_streams) in [(false, false), (true, true)] {
+        let label = format!("Info in object streams {object_streams}");
+        sources.push((label, save(&mut doc, object_streams, xref_streams)));
+    }
+
+    for (label, bytes) in sources {
+        let eager = Document::load_metadata_mem(&bytes).unwrap();
+        let lazy = LazyDocument::from_source(bytes.as_slice(), LoadOptions::default())
+            .unwrap()
+            .metadata()
+            .unwrap();
+        let fields = |metadata: &lopdf::PdfMetadata| {
+            let mut custom: Vec<String> = metadata.custom.iter().map(|entry| format!("{entry:?}")).collect();
+            custom.sort();
+            (
+                [
+                    metadata.title.clone(),
+                    metadata.author.clone(),
+                    metadata.subject.clone(),
+                    metadata.keywords.clone(),
+                    metadata.creator.clone(),
+                    metadata.producer.clone(),
+                    metadata.creation_date.clone(),
+                    metadata.modification_date.clone(),
+                ],
+                custom,
+                metadata.version.clone(),
+                metadata.encrypted,
+            )
+        };
+        assert_eq!(fields(&lazy), fields(&eager), "{label}");
+        // The eager metadata loader cannot read a page tree kept in an object stream, as in
+        // encrypted.pdf, and counts no pages; the full eager load counts them.
+        let pages = Document::load_mem(&bytes).unwrap().get_pages().len() as u32;
+        assert_eq!(lazy.page_count, pages, "{label}");
+        if label.starts_with("Info") {
+            assert_eq!(lazy.title.as_deref(), Some("Caf\u{e9}"));
+            assert_eq!(lazy.author.as_deref(), Some("Ann Author"));
+            assert_eq!(lazy.page_count, 4);
+        }
+    }
+}
+
+#[test]
 fn classic_xref_stream_and_object_stream_files_match_the_eager_reader() {
     for (label, object_streams, xref_streams) in [
         ("classic table", false, false),
