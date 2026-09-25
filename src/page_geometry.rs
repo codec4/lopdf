@@ -28,7 +28,7 @@ impl PageRect {
     };
 
     /// Reads `[x1 y1 x2 y2]`, with its corners in either order.
-    fn read<R: ObjectResolver + ?Sized>(resolver: &R, object: &Object) -> Result<Option<Self>> {
+    pub(crate) fn read<R: ObjectResolver + ?Sized>(resolver: &R, object: &Object) -> Result<Option<Self>> {
         let Some(object) = skip_unless_io(dereference(resolver, object))? else {
             return Ok(None);
         };
@@ -82,6 +82,16 @@ impl PageRect {
             overlap
         }
     }
+}
+
+/// A rectangle on a page as it is displayed, in points from the displayed page's top-left corner,
+/// with `left <= right` and `top <= bottom`: the space a viewer reports a tap in.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DisplayedRect {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
 }
 
 /// A page as viewers display it. pdfium, which the Android PDF renderer uses, shows the
@@ -163,6 +173,31 @@ impl PageGeometry {
             (self.visible.width(), self.visible.height())
         } else {
             (self.visible.height(), self.visible.width())
+        }
+    }
+
+    /// Where `rect`, in user space, sits on the page as displayed: shifted to the visible box's
+    /// corner, turned with the page, and measured down from the top, as a viewer reports a tap.
+    ///
+    /// Turning the page a quarter clockwise brings its left edge to the top and its bottom edge to
+    /// the left, so a point's distance down the displayed page is its distance from the left edge
+    /// in user space, and so on round the page, the same way [`Self::top_fraction`] reads a view.
+    pub fn displayed_rect(&self, rect: PageRect) -> DisplayedRect {
+        let visible = &self.visible;
+        let displayed = |x: f32, y: f32| match self.quarter_turns {
+            0 => (x - visible.left, visible.top - y),
+            1 => (y - visible.bottom, x - visible.left),
+            2 => (visible.right - x, y - visible.bottom),
+            _ => (visible.top - y, visible.right - x),
+        };
+        // Opposite corners stay opposite through a quarter turn, so two are enough.
+        let (x1, y1) = displayed(rect.left, rect.bottom);
+        let (x2, y2) = displayed(rect.right, rect.top);
+        DisplayedRect {
+            left: x1.min(x2),
+            top: y1.min(y2),
+            right: x1.max(x2),
+            bottom: y1.max(y2),
         }
     }
 

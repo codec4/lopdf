@@ -1,7 +1,9 @@
 //! `PageGeometry` reads a page's visible box and rotation as pdfium does, and measures where a
 //! destination's view puts the top of the window on the displayed page.
 
-use lopdf::{DestinationView, Dictionary, Document, Object, ObjectId, PageGeometry, PageRect, dictionary};
+use lopdf::{
+    DestinationView, Dictionary, DisplayedRect, Document, Object, ObjectId, PageGeometry, PageRect, dictionary,
+};
 
 #[test]
 fn the_visible_box_is_the_crop_box_clipped_to_the_media_box() {
@@ -107,6 +109,30 @@ fn views_are_measured_from_the_edge_displayed_on_top() {
         quarter_turns: 0,
     };
     assert_eq!(empty.top_fraction(xyz(None, Some(10.0))), None);
+}
+
+#[test]
+fn a_rectangle_is_placed_on_the_page_as_displayed() {
+    // A visible box offset from the origin, as a crop box inside a bleed is: the rectangle sits
+    // 100 points in from its left and 50 down from its top.
+    let geometry = |quarter_turns| PageGeometry {
+        visible: page_rect(20.0, 30.0, 620.0, 830.0),
+        quarter_turns,
+    };
+    let link = page_rect(120.0, 730.0, 220.0, 780.0);
+    let displayed = |left, top, right, bottom| DisplayedRect {
+        left,
+        top,
+        right,
+        bottom,
+    };
+
+    assert_eq!(geometry(0).displayed_rect(link), displayed(100.0, 50.0, 200.0, 100.0));
+    // A quarter clockwise brings the top edge to the right and the left edge to the top.
+    assert_eq!(geometry(1).displayed_rect(link), displayed(700.0, 100.0, 750.0, 200.0));
+    assert_eq!(geometry(2).displayed_rect(link), displayed(400.0, 700.0, 500.0, 750.0));
+    // Three quarters brings the top edge to the left and the left edge to the bottom.
+    assert_eq!(geometry(3).displayed_rect(link), displayed(50.0, 400.0, 100.0, 500.0));
 }
 
 fn geometry(quarter_turns: u8) -> PageGeometry {

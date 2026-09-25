@@ -116,18 +116,7 @@ impl DocumentOutline {
         let Some(first) = first.and_then(|first| first.as_reference().ok()) else {
             return Ok(outline);
         };
-        let pages = resolver
-            .page_ids()?
-            .into_iter()
-            .enumerate()
-            .map(|(index, id)| (id, index as u32 + 1))
-            .collect();
-        let mut destinations = Destinations {
-            resolver,
-            catalog: &catalog,
-            pages,
-            named: HashMap::new(),
-        };
+        let mut destinations = Destinations::new(resolver, catalog, &resolver.page_ids()?);
 
         // Preorder walk: an item, its children, then its next sibling. `resume` holds the next
         // siblings of the items whose children are being read.
@@ -177,7 +166,7 @@ impl DocumentOutline {
     }
 }
 
-fn catalog<R: ObjectResolver + ?Sized>(resolver: &R) -> Result<Dictionary> {
+pub(crate) fn catalog<R: ObjectResolver + ?Sized>(resolver: &R) -> Result<Dictionary> {
     let root = resolver.trailer().get(b"Root").and_then(Object::as_reference)?;
     resolver.object(root)?.as_dict().cloned()
 }
@@ -197,17 +186,34 @@ fn title<R: ObjectResolver + ?Sized>(resolver: &R, node: &Dictionary) -> Result<
     Ok(Some(text.split_whitespace().collect::<Vec<_>>().join(" ")))
 }
 
-struct Destinations<'a, R: ?Sized> {
+/// Where destinations lead in one document: an outline item's, or a link annotation's, which name
+/// their target the same two ways.
+pub(crate) struct Destinations<'a, R: ?Sized> {
     resolver: &'a R,
-    catalog: &'a Dictionary,
+    catalog: Dictionary,
     pages: HashMap<ObjectId, u32>,
     /// Named destinations already looked up, found or not.
     named: HashMap<Vec<u8>, Option<Object>>,
 }
 
-impl<R: ObjectResolver + ?Sized> Destinations<'_, R> {
-    /// The target of an outline item, from its `/Dest` or its `/GoTo` action.
-    fn item_target(&mut self, node: &Dictionary) -> Result<Option<OutlineTarget>> {
+impl<'a, R: ObjectResolver + ?Sized> Destinations<'a, R> {
+    /// Resolves destinations against `catalog` and the pages `page_ids` lists in page-tree order.
+    pub(crate) fn new(resolver: &'a R, catalog: Dictionary, page_ids: &[ObjectId]) -> Self {
+        Self {
+            resolver,
+            catalog,
+            pages: page_ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| (*id, index as u32 + 1))
+                .collect(),
+            named: HashMap::new(),
+        }
+    }
+
+    /// The target of an outline item or a link annotation, from its `/Dest` or its `/GoTo`
+    /// action.
+    pub(crate) fn item_target(&mut self, node: &Dictionary) -> Result<Option<OutlineTarget>> {
         if let Ok(destination) = node.get(b"Dest") {
             return self.destination(destination);
         }
