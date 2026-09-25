@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use crate::resolver::{ObjectResolver, dereference, skip_unless_io};
-use crate::{Dictionary, Object, ObjectId, Result, decode_text_string};
+use crate::{Dictionary, Object, ObjectId, Result, StringFormat, decode_text_string};
 
 /// Bounds on an outline walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,7 +172,8 @@ pub(crate) fn catalog<R: ObjectResolver + ?Sized>(resolver: &R) -> Result<Dictio
 }
 
 /// The item's title with its whitespace collapsed to single spaces, or `None` when it has no
-/// readable one. Titles often carry the line break of a two-line heading.
+/// readable one. Titles often carry the line break of a two-line heading. A control character reads
+/// as a space, as pdfium shows it: some producers pad a UTF-16 title with NULs.
 fn title<R: ObjectResolver + ?Sized>(resolver: &R, node: &Dictionary) -> Result<Option<String>> {
     let Some(title) = skip_unless_io(node.get(b"Title").and_then(|title| dereference(resolver, title)))? else {
         return Ok(None);
@@ -180,10 +181,30 @@ fn title<R: ObjectResolver + ?Sized>(resolver: &R, node: &Dictionary) -> Result<
     let Ok(bytes) = title.as_str() else {
         return Ok(None);
     };
-    let text = decode_text_string(&title);
+    let text = decode_text_string(&Object::String(
+        pdf_doc_controls_as_spaces(bytes),
+        StringFormat::Literal,
+    ));
     // An undecodable string still reads better than nothing.
     let text = text.unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned());
+    let text: String = text.chars().map(|c| if c < ' ' { ' ' } else { c }).collect();
     Ok(Some(text.split_whitespace().collect::<Vec<_>>().join(" ")))
+}
+
+/// A PDFDocEncoding string's control bytes, which PDFDocEncoding leaves undefined and decoding
+/// drops, as spaces. Bytes 0x18 to 0x1F are accents there, and a string with a byte order mark is
+/// not PDFDocEncoding at all.
+fn pdf_doc_controls_as_spaces(bytes: &[u8]) -> Vec<u8> {
+    let unicode = [&b"\xFE\xFF"[..], b"\xFF\xFE", b"\xEF\xBB\xBF"]
+        .iter()
+        .any(|mark| bytes.starts_with(mark));
+    if unicode {
+        return bytes.to_vec();
+    }
+    bytes
+        .iter()
+        .map(|&byte| if byte < 0x18 { b' ' } else { byte })
+        .collect()
 }
 
 /// Where destinations lead in one document: an outline item's, or a link annotation's, which name

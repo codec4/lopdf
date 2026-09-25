@@ -38,13 +38,17 @@ enum Target {
 }
 
 struct Entry {
-    /// `None` leaves out `/Title`.
-    title: Option<&'static str>,
+    /// The bytes of `/Title`; `None` leaves it out.
+    title: Option<Vec<u8>>,
     target: Target,
     children: Vec<Entry>,
 }
 
 fn entry(title: &'static str, target: Target) -> Entry {
+    titled(title.as_bytes().to_vec(), target)
+}
+
+fn titled(title: Vec<u8>, target: Target) -> Entry {
     Entry {
         title: Some(title),
         target,
@@ -227,6 +231,13 @@ fn positions() -> Fixture {
             entry("No destination", Target::None),
             untitled,
             entry("Tab\tand  spaces \r\nin a title", Target::Explicit(0, "Fit", vec![])),
+            // Some producers pad a UTF-16 title with as many NULs again, as socialpsych.pdf does.
+            titled(
+                utf16(&format!("Padded title{}", "\0".repeat(12))),
+                Target::Explicit(0, "Fit", vec![]),
+            ),
+            titled(utf16("Before\0after"), Target::Explicit(0, "Fit", vec![])),
+            titled(b"Control\x01character".to_vec(), Target::Explicit(0, "Fit", vec![])),
         ]
     }
     ("positions", pages, named, entries)
@@ -254,6 +265,13 @@ fn letter() -> Fixture {
         )]
     }
     ("letter", pages, named, entries)
+}
+
+/// A text string in UTF-16BE, with its byte order mark.
+fn utf16(text: &str) -> Vec<u8> {
+    let mut bytes = vec![0xfe, 0xff];
+    bytes.extend(text.encode_utf16().flat_map(u16::to_be_bytes));
+    bytes
 }
 
 fn rect(left: i64, bottom: i64, right: i64, top: i64) -> Object {
@@ -360,7 +378,7 @@ fn add_entries(
     for (index, entry) in entries.into_iter().enumerate() {
         let mut node = dictionary! { "Parent" => parent };
         if let Some(title) = entry.title {
-            node.set("Title", Object::string_literal(title));
+            node.set("Title", Object::String(title, StringFormat::Literal));
         }
         if index > 0 {
             node.set("Prev", ids[index - 1]);

@@ -148,6 +148,47 @@ fn goto_actions_and_named_destinations_resolve_and_other_actions_do_not() {
 }
 
 #[test]
+fn control_characters_in_a_title_read_as_spaces_as_pdfium_reads_them() {
+    // socialpsych.pdf pads each UTF-16 title with as many NULs again. pdfium shows every control
+    // character in a title as a space, whatever the title's encoding.
+    let padded = |text: &str, nuls: usize| {
+        let mut bytes = b"\xFE\xFF".to_vec();
+        bytes.extend(
+            text.encode_utf16()
+                .chain(std::iter::repeat_n(0, nuls))
+                .flat_map(u16::to_be_bytes),
+        );
+        Object::String(bytes, StringFormat::Hexadecimal)
+    };
+    let (doc, _) = with_outline(1, |_| {
+        vec![
+            titled(padded("About the Authors", 24)),
+            titled(padded("Before\0after", 0)),
+            titled(Object::String(b"Control\x01character".to_vec(), StringFormat::Literal)),
+            // PDFDocEncoding's 0x18 to 0x1F are accents, not control characters.
+            titled(Object::String(b"Breve \x18 kept".to_vec(), StringFormat::Literal)),
+        ]
+    });
+
+    let titles: Vec<String> = DocumentOutline::read(&doc)
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|item| item.title)
+        .collect();
+
+    assert_eq!(
+        titles,
+        [
+            "About the Authors",
+            "Before after",
+            "Control character",
+            "Breve \u{2D8} kept"
+        ]
+    );
+}
+
+#[test]
 fn titles_decode_from_every_text_encoding() {
     let (doc, _) = with_outline(1, |_| {
         vec![
