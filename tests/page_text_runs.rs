@@ -2,20 +2,25 @@
 
 #![cfg(feature = "lazy-reader")]
 
+use std::collections::BTreeMap;
+
 use lopdf::content::{Content, Operation};
 use lopdf::lazy::LazyDocument;
-use lopdf::{DecodeLimits, Document, LoadOptions, Object, ObjectId, SaveOptions, Stream, StringFormat, dictionary};
+use lopdf::{
+    DecodeLimits, Document, LoadOptions, Object, ObjectId, PageTextRun, SaveOptions, Stream, StringFormat, dictionary,
+};
 
 const LIMIT: usize = 16 * 1024 * 1024;
+
+fn literal(text: &str) -> Object {
+    Object::String(text.as_bytes().to_vec(), StringFormat::Literal)
+}
 
 fn show(font: &str, text: &str) -> Vec<Operation> {
     vec![
         Operation::new("BT", vec![]),
         Operation::new("Tf", vec![font.into(), 12.into()]),
-        Operation::new(
-            "Tj",
-            vec![Object::String(text.as_bytes().to_vec(), StringFormat::Literal)],
-        ),
+        Operation::new("Tj", vec![literal(text)]),
         Operation::new("ET", vec![]),
     ]
 }
@@ -37,14 +42,30 @@ fn font(doc: &mut Document, base: &str) -> ObjectId {
     })
 }
 
+fn font_with_differences(doc: &mut Document, base: &str, differences: Vec<Object>) -> ObjectId {
+    doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => base,
+        "Encoding" => dictionary! { "Type" => "Encoding", "Differences" => differences },
+    })
+}
+
 /// One page: text in two fonts, then a form with its own font, a form with no resources, a form
-/// that draws itself, and an image.
+/// that draws itself, and an image, then text in two fonts with `/Differences`.
 fn fixture() -> (Vec<u8>, ObjectId) {
     let mut doc = Document::with_version("1.7");
     let pages_id = doc.new_object_id();
     let body = font(&mut doc, "ABCDEF+TimesLTStd-Roman");
     let maths = font(&mut doc, "MathematicalPiLTStd-3");
     let form_font = font(&mut doc, "MathematicalPiLTStd-1");
+    // Names from a type foundry's catalogue, which have no Unicode reading.
+    let catalogue = font_with_differences(
+        &mut doc,
+        "MathematicalPi-One-Italic",
+        vec![33.into(), "H9266".into(), "H9258".into()],
+    );
+    let minus = font_with_differences(&mut doc, "MathematicalPiLTStd-5", vec![33.into(), "minus".into()]);
 
     let own = doc.add_object(stream(
         dictionary! {
@@ -86,6 +107,16 @@ fn fixture() -> (Vec<u8>, ObjectId) {
             show("F1", "Hello"),
             show("F2", "sdk"),
             vec![draw("Own"), draw("Bare"), draw("Loop"), draw("Img")],
+            show("F3", "!\""),
+            vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F4".into(), 12.into()]),
+                Operation::new(
+                    "TJ",
+                    vec![Object::Array(vec![literal("!"), (-200).into(), literal("!")])],
+                ),
+                Operation::new("ET", vec![]),
+            ],
         ]
         .concat(),
     ));
@@ -95,7 +126,7 @@ fn fixture() -> (Vec<u8>, ObjectId) {
         "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
         "Contents" => content,
         "Resources" => dictionary! {
-            "Font" => dictionary! { "F1" => body, "F2" => maths },
+            "Font" => dictionary! { "F1" => body, "F2" => maths, "F3" => catalogue, "F4" => minus },
             "XObject" => dictionary! { "Own" => own, "Bare" => bare, "Loop" => looping, "Img" => image },
         },
     });
@@ -110,13 +141,10 @@ fn fixture() -> (Vec<u8>, ObjectId) {
     (bytes, page)
 }
 
-fn runs(bytes: &[u8], page: ObjectId) -> Vec<(String, String)> {
+fn runs(bytes: &[u8], page: ObjectId) -> Vec<PageTextRun> {
     let lazy = LazyDocument::from_source(bytes, LoadOptions::default()).unwrap();
     lazy.extract_page_text_runs_with_limits(page, DecodeLimits::uniform(LIMIT))
         .unwrap()
-        .into_iter()
-        .map(|run| (String::from_utf8(run.font).unwrap(), run.text.trim().to_owned()))
-        .collect()
 }
 
 #[test]
@@ -124,7 +152,10 @@ fn each_run_names_its_font_and_the_forms_a_page_draws_are_read() {
     let (bytes, page) = fixture();
 
     assert_eq!(
-        runs(&bytes, page),
+        runs(&bytes, page)
+            .into_iter()
+            .map(|run| (String::from_utf8(run.font).unwrap(), run.text.trim().to_owned()))
+            .collect::<Vec<_>>(),
         [
             ("TimesLTStd-Roman", "Hello"),
             // A maths font's letters, which only its name tells apart from prose.
@@ -135,9 +166,39 @@ fn each_run_names_its_font_and_the_forms_a_page_draws_are_read() {
             ("TimesLTStd-Roman", "inherited"),
             // A form that draws itself is read once, and an image not at all.
             ("TimesLTStd-Roman", "once"),
+            ("MathematicalPi-One-Italic", "!\""),
+            ("MathematicalPiLTStd-5", "\u{2212} \u{2212}"),
         ]
         .map(|(font, text)| (font.to_owned(), text.to_owned()))
     );
+}
+
+#[test]
+fn a_run_keeps_the_codes_it_showed_and_the_names_its_font_gives_them() {
+    let (bytes, page) = fixture();
+    let runs = runs(&bytes, page);
+    let run = |font: &str| runs.iter().find(|run| run.font == font.as_bytes()).unwrap();
+    let names = |pairs: &[(u8, &str)]| {
+        pairs
+            .iter()
+            .map(|&(code, name)| (code, name.as_bytes().to_vec()))
+            .collect::<BTreeMap<_, _>>()
+    };
+
+    // The text falls back to the standard encoding, but the names are still there to read.
+    let catalogue = run("MathematicalPi-One-Italic");
+    assert_eq!(catalogue.codes, [(0, b'!'), (1, b'"')]);
+    assert_eq!(*catalogue.differences, names(&[(33, "H9266"), (34, "H9258")]));
+
+    // A kerned space falls between codes, and the minus sign takes three bytes of the text.
+    let minus = run("MathematicalPiLTStd-5");
+    assert_eq!(minus.text, "\u{2212} \u{2212} \n");
+    assert_eq!(minus.codes, [(0, b'!'), (4, b'!')]);
+    assert_eq!(*minus.differences, names(&[(33, "minus")]));
+
+    let prose = run("TimesLTStd-Roman");
+    assert_eq!(prose.codes[..2], [(0, b'H'), (1, b'e')]);
+    assert!(prose.differences.is_empty());
 }
 
 #[test]

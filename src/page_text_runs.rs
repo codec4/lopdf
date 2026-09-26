@@ -3,8 +3,10 @@
 //! A font whose `/ToUnicode` is missing or wrong, and whose glyphs are named after the letters at
 //! their codes, reports characters it does not draw: a maths font draws `⟨` at the code of `k`,
 //! and the text says `k`. Nothing in the text tells the two apart; only the font it came from
-//! does, which is why each run carries its font's name. A page drawn inside a Form XObject, as a
-//! third of some textbooks' pages are, has its text in the form, read with the form's own
+//! does, which is why each run carries its font's name. Where the font's encoding reads a byte at
+//! a time, the run also keeps each code it showed and the names the font's `/Differences` gives
+//! them, so a caller that knows a font's glyphs can read them. A page drawn inside a Form XObject,
+//! as a third of some textbooks' pages are, has its text in the form, read with the form's own
 //! resources.
 
 use std::collections::BTreeMap;
@@ -13,7 +15,6 @@ use std::rc::Rc;
 use crate::encodings::Encoding;
 use crate::page_content::PageContent;
 use crate::parser;
-use crate::parser_aux::collect_text;
 use crate::{DecodeLimits, Dictionary, Document, Object, ObjectId, Result};
 
 /// How deep forms drawn inside forms are followed.
@@ -27,14 +28,27 @@ pub struct PageTextRun {
     /// The text as the font's encoding decodes it, with the breaks and spaces the page's plain
     /// text extraction puts in.
     pub text: String,
+    /// Each code shown, with the byte offset in `text` of the one character it decoded to, for a
+    /// font whose encoding reads a byte at a time. A code that decoded to no character, or to
+    /// several, is left out, and so is every code of a font read through its `/ToUnicode` alone.
+    pub codes: Vec<(usize, u8)>,
+    /// The glyph names the font's `/Differences` gives codes, spelt as in the file. A name with no
+    /// Unicode reading, such as a type foundry's catalogue number, is kept here, although the text
+    /// then falls back to the standard encoding for the whole font.
+    pub differences: Rc<BTreeMap<u8, Vec<u8>>>,
 }
 
-/// A font a content stream names: its `/BaseFont` and its encoding.
-type Font<'a> = Rc<(Vec<u8>, Encoding<'a>)>;
+/// A font a content stream names.
+struct Font<'a> {
+    /// `/BaseFont` without a subset prefix.
+    name: Vec<u8>,
+    encoding: Encoding<'a>,
+    differences: Rc<BTreeMap<u8, Vec<u8>>>,
+}
 
 /// What a content stream can name: its fonts and its forms.
 struct Scope<'a> {
-    fonts: BTreeMap<Vec<u8>, Font<'a>>,
+    fonts: BTreeMap<Vec<u8>, Rc<Font<'a>>>,
     forms: BTreeMap<Vec<u8>, ObjectId>,
 }
 
@@ -54,8 +68,8 @@ impl Document {
             forms: BTreeMap::new(),
         };
         for (name, font) in self.get_page_fonts(page_id)? {
-            if let Ok(encoding) = font.get_font_encoding_with_limit(self, limits.max_stream_size) {
-                scope.fonts.insert(name, Rc::new((base_font(font), encoding)));
+            if let Some(font) = self.run_font(font, limits) {
+                scope.fonts.insert(name, font);
             }
         }
         for dictionary in resources.iter().rev() {
@@ -71,6 +85,46 @@ impl Document {
         };
         reader.read(&scope, &mut content)?;
         Ok(reader.runs)
+    }
+
+    fn run_font<'a>(&'a self, font: &'a Dictionary, limits: DecodeLimits) -> Option<Rc<Font<'a>>> {
+        let encoding = font.get_font_encoding_with_limit(self, limits.max_stream_size).ok()?;
+        Some(Rc::new(Font {
+            name: base_font(font),
+            encoding,
+            differences: Rc::new(self.differences(font)),
+        }))
+    }
+
+    /// The names a font's `/Differences` gives its codes, whether or not a name has a Unicode
+    /// reading.
+    fn differences(&self, font: &Dictionary) -> BTreeMap<u8, Vec<u8>> {
+        let mut names = BTreeMap::new();
+        let Some(differences) = font
+            .get(b"Encoding")
+            .ok()
+            .and_then(|e| self.dereference(e).ok())
+            .and_then(|(_, e)| e.as_dict().ok())
+            .and_then(|e| e.get(b"Differences").ok())
+            .and_then(|d| self.dereference(d).ok())
+            .and_then(|(_, d)| d.as_array().ok())
+        else {
+            return names;
+        };
+        let mut code = None;
+        for entry in differences {
+            match entry {
+                Object::Integer(at) => code = u8::try_from(*at).ok(),
+                Object::Name(name) => {
+                    if let Some(at) = code {
+                        names.insert(at, name.clone());
+                    }
+                    code = code.and_then(|at| at.checked_add(1));
+                }
+                _ => {}
+            }
+        }
+        names
     }
 
     /// The forms a resources dictionary's `/XObject` names; entries that are not references are
@@ -119,8 +173,8 @@ impl Document {
                 let Some(font) = self.dereference(value).ok().and_then(|(_, f)| f.as_dict().ok()) else {
                     continue;
                 };
-                if let Ok(encoding) = font.get_font_encoding_with_limit(self, limits.max_stream_size) {
-                    fonts.insert(name.clone(), Rc::new((base_font(font), encoding)));
+                if let Some(font) = self.run_font(font, limits) {
+                    fonts.insert(name.clone(), font);
                 }
             }
         }
@@ -147,13 +201,13 @@ impl<'a, 'c> RunReader<'a, 'c> {
         let max_operation_size = self.limits.max_stream_size;
         let operations =
             parser::ChunkedContentOperations::new(|buffer: &mut Vec<u8>| content.read_into(buffer), max_operation_size);
-        let mut font: Option<&Font<'a>> = None;
-        let mut text = String::new();
+        let mut font: Option<&Rc<Font<'a>>> = None;
+        let mut run = Run::default();
         for operation in operations {
             let operation = operation?;
             match operation.operator.as_ref() {
                 "Tf" => {
-                    self.push(font, &mut text);
+                    self.push(font, &mut run);
                     font = operation
                         .operands
                         .first()
@@ -162,23 +216,21 @@ impl<'a, 'c> RunReader<'a, 'c> {
                 }
                 "Tj" | "TJ" => {
                     if let Some(font) = font {
-                        let _ = collect_text(&mut text, &font.1, &operation.operands);
+                        let _ = run.collect(&font.encoding, &operation.operands);
                     }
                 }
                 "'" | "\"" => {
                     if let Some(font) = font {
-                        if !text.ends_with('\n') {
-                            text.push('\n');
-                        }
+                        run.line_break();
                         let shown = if operation.operator == "'" { 0 } else { 2 };
                         if let Some(string) = operation.operands.get(shown) {
-                            let _ = collect_text(&mut text, &font.1, std::slice::from_ref(string));
+                            let _ = run.collect(&font.encoding, std::slice::from_ref(string));
                         }
                     }
                 }
-                "T*" | "ET" if !text.ends_with('\n') => text.push('\n'),
+                "T*" | "ET" => run.line_break(),
                 "Do" => {
-                    self.push(font, &mut text);
+                    self.push(font, &mut run);
                     let Some(id) = operation
                         .operands
                         .first()
@@ -208,19 +260,71 @@ impl<'a, 'c> RunReader<'a, 'c> {
                 _ => {}
             }
         }
-        self.push(font, &mut text);
+        self.push(font, &mut run);
         self.spent += content.len();
         Ok(())
     }
 
-    fn push(&mut self, font: Option<&Font<'a>>, text: &mut String) {
-        if text.is_empty() {
+    fn push(&mut self, font: Option<&Rc<Font<'a>>>, run: &mut Run) {
+        if run.text.is_empty() {
             return;
         }
+        let Run { text, codes } = std::mem::take(run);
         self.runs.push(PageTextRun {
-            font: font.map(|font| font.0.clone()).unwrap_or_default(),
-            text: std::mem::take(text),
+            font: font.map(|font| font.name.clone()).unwrap_or_default(),
+            text,
+            codes,
+            differences: font.map(|font| font.differences.clone()).unwrap_or_default(),
         });
+    }
+}
+
+/// The text of the run being read, and its codes.
+#[derive(Default)]
+struct Run {
+    text: String,
+    codes: Vec<(usize, u8)>,
+}
+
+impl Run {
+    /// Reads the strings a text operator shows as the plain text extraction does, byte by byte
+    /// where the encoding reads a byte at a time.
+    fn collect(&mut self, encoding: &Encoding, operands: &[Object]) -> Result<()> {
+        for operand in operands {
+            match operand {
+                Object::String(bytes, _) => self.show(encoding, bytes)?,
+                Object::Array(array) => {
+                    self.collect(encoding, array)?;
+                    self.text.push(' ');
+                }
+                Object::Integer(i) if *i < -100 => self.text.push(' '),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn show(&mut self, encoding: &Encoding, bytes: &[u8]) -> Result<()> {
+        if !matches!(
+            encoding,
+            Encoding::OneByteEncoding(_) | Encoding::Differences(_) | Encoding::SimpleEncoding(b"WinAnsiEncoding")
+        ) {
+            return encoding.write_to_string(bytes, &mut self.text);
+        }
+        for &code in bytes {
+            let at = self.text.len();
+            encoding.write_to_string(&[code], &mut self.text)?;
+            if self.text[at..].chars().count() == 1 {
+                self.codes.push((at, code));
+            }
+        }
+        Ok(())
+    }
+
+    fn line_break(&mut self) {
+        if !self.text.ends_with('\n') {
+            self.text.push('\n');
+        }
     }
 }
 
