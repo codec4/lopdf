@@ -4,8 +4,9 @@
 //! their codes, reports characters it does not draw: a maths font draws `⟨` at the code of `k`,
 //! and the text says `k`. Nothing in the text tells the two apart; only the font it came from
 //! does, which is why each run carries its font's name. Where the font's encoding reads a byte at
-//! a time, the run also keeps each code it showed and the names the font's `/Differences` gives
-//! them, so a caller that knows a font's glyphs can read them. A page drawn inside a Form XObject,
+//! a time, or a composite font's reads two bytes as a glyph's number, the run also keeps each code
+//! it showed and the names the font's `/Differences` gives them, so a caller that knows a font's
+//! glyphs can read them. A page drawn inside a Form XObject,
 //! as a third of some textbooks' pages are, has its text in the form, read with the form's own
 //! resources.
 
@@ -28,12 +29,14 @@ pub struct PageTextRun {
     /// The text as pdfium reads it: through the font's `/ToUnicode` map where it has one, and its
     /// encoding otherwise, with the breaks and spaces the page's plain text extraction puts in. A
     /// simple font's code the encoding has no character for reads as the character of its number,
-    /// as pdfium reads it, where the plain text extraction leaves it out.
+    /// as pdfium reads it, where the plain text extraction leaves it out, and so does a code of a
+    /// composite font with an `Identity` encoding and no map, two bytes to a code.
     pub text: String,
-    /// Each code shown, with the byte offset in `text` of the one character it decoded to, for a
-    /// simple font, whose codes are bytes. A code that decoded to several characters is left out,
-    /// and so is every code of a composite font.
-    pub codes: Vec<(usize, u8)>,
+    /// Each code shown, with the byte offset in `text` of the one character it decoded to: the
+    /// bytes of a simple font, and the two-byte codes of a composite font read as their numbers. A
+    /// code that decoded to several characters is left out, and so is every code of any other
+    /// composite font.
+    pub codes: Vec<(usize, u16)>,
     /// The glyph names the font's `/Differences` gives codes, spelt as in the file. A name with no
     /// Unicode reading, such as a type foundry's catalogue number, is kept here, while the text
     /// reads its code by the base encoding.
@@ -47,6 +50,10 @@ struct Font<'a> {
     encoding: Encoding<'a>,
     /// Whether each code is a byte: every font but a composite (`Type0`) one.
     simple: bool,
+    /// Whether the font is composite, encoded `/Identity-H` or `/Identity-V` and without a
+    /// `/ToUnicode` map, so that each two bytes are a glyph's number: pdfium reads that number as
+    /// the character, and so do the runs.
+    identity: bool,
     differences: Rc<BTreeMap<u8, Vec<u8>>>,
 }
 
@@ -102,6 +109,13 @@ impl Document {
             .and_then(|t| self.dereference(t).ok())
             .and_then(|(_, t)| t.as_stream().ok())
             .and_then(|stream| font.get_to_unicode_encoding(stream, Some(limits.max_stream_size)).ok());
+        let simple = font.get(b"Subtype").and_then(Object::as_name).ok() != Some(b"Type0".as_slice());
+        let identity = !simple
+            && to_unicode.is_none()
+            && matches!(
+                font.get(b"Encoding").and_then(Object::as_name),
+                Ok(b"Identity-H" | b"Identity-V")
+            );
         let encoding = match to_unicode {
             Some(encoding) => encoding,
             None => font.get_font_encoding_with_limit(self, limits.max_stream_size).ok()?,
@@ -109,7 +123,8 @@ impl Document {
         Some(Rc::new(Font {
             name: base_font(font),
             encoding,
-            simple: font.get(b"Subtype").and_then(Object::as_name).ok() != Some(b"Type0".as_slice()),
+            simple,
+            identity,
             differences: Rc::new(self.differences(font)),
         }))
     }
@@ -322,7 +337,7 @@ fn same_font(a: Option<&Rc<Font>>, b: Option<&Rc<Font>>) -> bool {
 #[derive(Default)]
 struct Run {
     text: String,
-    codes: Vec<(usize, u8)>,
+    codes: Vec<(usize, u16)>,
 }
 
 impl Run {
@@ -343,8 +358,19 @@ impl Run {
     }
 
     /// Reads a shown string, a byte at a time where each code is a byte: in a simple font, and in
-    /// any font whose encoding reads bytes.
+    /// any font whose encoding reads bytes. An `Identity` font without a map reads two bytes at a
+    /// time, each code as the character of its number; Brase's *Understandable Statistics* sets
+    /// prose in such subsets, whose numbers are the glyphs' places in the whole font.
     fn show(&mut self, font: &Font, bytes: &[u8]) -> Result<()> {
+        if font.identity {
+            for &pair in bytes.as_chunks::<2>().0 {
+                let code = u16::from_be_bytes(pair);
+                self.codes.push((self.text.len(), code));
+                self.text
+                    .push(char::from_u32(u32::from(code)).unwrap_or(char::REPLACEMENT_CHARACTER));
+            }
+            return Ok(());
+        }
         let encoding = &font.encoding;
         let bytewise = font.simple
             || matches!(
@@ -363,7 +389,7 @@ impl Run {
                 self.text.push(char::from(code));
             }
             if self.text[at..].chars().count() == 1 {
-                self.codes.push((at, code));
+                self.codes.push((at, u16::from(code)));
             }
         }
         Ok(())

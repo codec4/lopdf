@@ -195,22 +195,22 @@ fn a_run_keeps_the_codes_it_showed_and_the_names_its_font_gives_them() {
 
     // The text falls back to the standard encoding, but the names are still there to read.
     let catalogue = run("MathematicalPi-One-Italic");
-    assert_eq!(catalogue.codes, [(0, b'!'), (1, b'"')]);
+    assert_eq!(catalogue.codes, [(0, 0x21), (1, 0x22)]);
     assert_eq!(*catalogue.differences, names(&[(33, "H9266"), (34, "H9258")]));
 
     // A kerned space falls between codes, and the minus sign takes three bytes of the text.
     let minus = run("MathematicalPiLTStd-5");
     assert_eq!(minus.text, "\u{2212} \u{2212} \n");
-    assert_eq!(minus.codes, [(0, b'!'), (4, b'!')]);
+    assert_eq!(minus.codes, [(0, 0x21), (4, 0x21)]);
     assert_eq!(*minus.differences, names(&[(33, "minus")]));
 
     // A code with no character reads as its number, as pdfium reads it, so it can be put right.
     let symbols = run("MT2SYT");
     assert_eq!(symbols.text, "\u{0}C\n");
-    assert_eq!(symbols.codes, [(0, 0x00), (1, b'C')]);
+    assert_eq!(symbols.codes, [(0, 0x00), (1, 0x43)]);
 
     let prose = run("TimesLTStd-Roman");
-    assert_eq!(prose.codes[..2], [(0, b'H'), (1, b'e')]);
+    assert_eq!(prose.codes[..2], [(0, 0x48), (1, 0x65)]);
     assert!(prose.differences.is_empty());
 }
 
@@ -288,6 +288,64 @@ fn the_font_follows_the_graphics_state_through_q_and_into_forms() {
 }
 
 #[test]
+fn an_identity_font_without_a_map_reads_each_code_as_its_number() {
+    // Brase's *Understandable Statistics*: a subset of Times whose codes are the glyphs' places in
+    // the whole font, `a` at 66, and no `/ToUnicode`. pdfium reads each code as the character of
+    // its number, and so do the runs, keeping the codes.
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let descendant = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "CIDFontType0",
+        "BaseFont" => "OOFFND+TimesLTStd-Roman",
+        "CIDSystemInfo" => dictionary! { "Registry" => Object::string_literal("Adobe"), "Ordering" => Object::string_literal("Identity"), "Supplement" => 0 },
+    });
+    let font = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type0",
+        "BaseFont" => "TimesLTStd-Roman-Identity-H",
+        "Encoding" => "Identity-H",
+        "DescendantFonts" => vec![descendant.into()],
+    });
+    let content = doc.add_object(stream(
+        dictionary! {},
+        vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 12.into()]),
+            Operation::new(
+                "Tj",
+                vec![Object::String(
+                    vec![0x00, 0x42, 0x00, 0x56, 0x00, 0x01],
+                    StringFormat::Hexadecimal,
+                )],
+            ),
+            Operation::new("ET", vec![]),
+        ],
+    ));
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => content,
+        "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_with_options(&mut bytes, SaveOptions::default()).unwrap();
+
+    let [run] = runs(&bytes, page).try_into().unwrap();
+
+    assert_eq!(run.font, b"TimesLTStd-Roman-Identity-H");
+    assert_eq!(run.text, "BV\u{1}\n");
+    assert_eq!(run.codes, [(0, 0x42), (1, 0x56), (2, 0x01)]);
+}
+
+#[test]
 fn a_font_with_a_unicode_map_reads_through_it_and_keeps_its_codes() {
     // A subset whose `/Differences` names glyphs no Unicode reading knows, as some producers do,
     // and whose `/ToUnicode` says what they are: pdfium reads the map, and so do the runs.
@@ -338,7 +396,7 @@ end
     let [run] = runs(&bytes, page).try_into().unwrap();
 
     assert_eq!(run.text, "Hi\n");
-    assert_eq!(run.codes, [(0, b'!'), (1, b'"')]);
+    assert_eq!(run.codes, [(0, 0x21), (1, 0x22)]);
     assert_eq!(run.differences.get(&b'!').map(Vec::as_slice), Some(b"g12".as_slice()));
 }
 
