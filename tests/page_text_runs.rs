@@ -201,6 +201,79 @@ fn a_run_keeps_the_codes_it_showed_and_the_names_its_font_gives_them() {
     assert!(prose.differences.is_empty());
 }
 
+/// One page whose content sets its maths inside `q ... Q`, then goes on in the font `Q` restores,
+/// and draws a form that shows text without setting a font of its own.
+fn graphics_state_fixture() -> (Vec<u8>, ObjectId) {
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let body = font(&mut doc, "TimesLTStd-Roman");
+    let maths = font(&mut doc, "MathematicalPiLTStd-3");
+    let form = doc.add_object(stream(
+        dictionary! { "Type" => "XObject", "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()] },
+        vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tj", vec![literal("inherited")]),
+            Operation::new("ET", vec![]),
+        ],
+    ));
+    let content = doc.add_object(stream(
+        dictionary! {},
+        [
+            show("F1", "Let"),
+            vec![Operation::new("q", vec![])],
+            show("F2", "sxd"),
+            vec![Operation::new("Q", vec![])],
+            vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tj", vec![literal("be")]),
+                Operation::new("ET", vec![]),
+                draw("Fm"),
+            ],
+        ]
+        .concat(),
+    ));
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => content,
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => body, "F2" => maths },
+            "XObject" => dictionary! { "Fm" => form },
+        },
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_with_options(&mut bytes, SaveOptions::default()).unwrap();
+    (bytes, page)
+}
+
+#[test]
+fn the_font_follows_the_graphics_state_through_q_and_into_forms() {
+    let (bytes, page) = graphics_state_fixture();
+
+    assert_eq!(
+        runs(&bytes, page)
+            .into_iter()
+            .map(|run| (String::from_utf8(run.font).unwrap(), run.text.trim().to_owned()))
+            .collect::<Vec<_>>(),
+        [
+            ("TimesLTStd-Roman", "Let"),
+            ("MathematicalPiLTStd-3", "sxd"),
+            // `Q` restores the font `q` saved, so what follows is prose again, not maths.
+            ("TimesLTStd-Roman", "be"),
+            // A form draws in the graphics state of the content that draws it.
+            ("TimesLTStd-Roman", "inherited"),
+        ]
+        .map(|(font, text)| (font.to_owned(), text.to_owned()))
+    );
+}
+
 #[test]
 fn on_pages_without_forms_the_runs_hold_the_page_text_exactly() {
     for asset in [

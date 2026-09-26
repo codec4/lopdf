@@ -83,7 +83,7 @@ impl Document {
             spent: 0,
             stack: Vec::new(),
         };
-        reader.read(&scope, &mut content)?;
+        reader.read(&scope, &mut content, None)?;
         Ok(reader.runs)
     }
 
@@ -197,30 +197,43 @@ struct RunReader<'a, 'c> {
 }
 
 impl<'a, 'c> RunReader<'a, 'c> {
-    fn read(&mut self, scope: &Scope<'a>, content: &mut PageContent<'c>) -> Result<()> {
+    /// Reads a content stream, starting in [`font`](Font), the font of the graphics state it is
+    /// drawn in: a form inherits the font of the content that draws it.
+    fn read(&mut self, scope: &Scope<'a>, content: &mut PageContent<'c>, mut font: Option<Rc<Font<'a>>>) -> Result<()> {
         let max_operation_size = self.limits.max_stream_size;
         let operations =
             parser::ChunkedContentOperations::new(|buffer: &mut Vec<u8>| content.read_into(buffer), max_operation_size);
-        let mut font: Option<&Rc<Font<'a>>> = None;
+        // The font is part of the graphics state, which `q` saves and `Q` restores.
+        let mut saved: Vec<Option<Rc<Font<'a>>>> = Vec::new();
         let mut run = Run::default();
         for operation in operations {
             let operation = operation?;
             match operation.operator.as_ref() {
                 "Tf" => {
-                    self.push(font, &mut run);
+                    self.push(font.as_ref(), &mut run);
                     font = operation
                         .operands
                         .first()
                         .and_then(|name| name.as_name().ok())
-                        .and_then(|name| scope.fonts.get(name));
+                        .and_then(|name| scope.fonts.get(name))
+                        .cloned();
+                }
+                "q" => saved.push(font.clone()),
+                "Q" => {
+                    if let Some(restored) = saved.pop() {
+                        if !same_font(restored.as_ref(), font.as_ref()) {
+                            self.push(font.as_ref(), &mut run);
+                        }
+                        font = restored;
+                    }
                 }
                 "Tj" | "TJ" => {
-                    if let Some(font) = font {
+                    if let Some(font) = &font {
                         let _ = run.collect(&font.encoding, &operation.operands);
                     }
                 }
                 "'" | "\"" => {
-                    if let Some(font) = font {
+                    if let Some(font) = &font {
                         run.line_break();
                         let shown = if operation.operator == "'" { 0 } else { 2 };
                         if let Some(string) = operation.operands.get(shown) {
@@ -230,7 +243,7 @@ impl<'a, 'c> RunReader<'a, 'c> {
                 }
                 "T*" | "ET" => run.line_break(),
                 "Do" => {
-                    self.push(font, &mut run);
+                    self.push(font.as_ref(), &mut run);
                     let Some(id) = operation
                         .operands
                         .first()
@@ -250,7 +263,7 @@ impl<'a, 'c> RunReader<'a, 'c> {
                         continue;
                     };
                     self.stack.push(id);
-                    let read = self.read(&inner, &mut form);
+                    let read = self.read(&inner, &mut form, font.clone());
                     self.stack.pop();
                     self.spent += form.len();
                     if read.is_err() {
@@ -260,7 +273,7 @@ impl<'a, 'c> RunReader<'a, 'c> {
                 _ => {}
             }
         }
-        self.push(font, &mut run);
+        self.push(font.as_ref(), &mut run);
         self.spent += content.len();
         Ok(())
     }
@@ -276,6 +289,14 @@ impl<'a, 'c> RunReader<'a, 'c> {
             codes,
             differences: font.map(|font| font.differences.clone()).unwrap_or_default(),
         });
+    }
+}
+
+fn same_font(a: Option<&Rc<Font>>, b: Option<&Rc<Font>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
     }
 }
 
