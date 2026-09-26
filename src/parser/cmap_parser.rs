@@ -138,11 +138,13 @@ fn cid_system_info(input: ParserInput) -> NomResult<()> {
         .map(|(i, _)| (i, ()))
 }
 
+/// `/CMapName /Name def`. Some producers write a file path as the name, `/Z:/Books/Font.otf`,
+/// which reads as several names, one after another; the map is no less readable for it.
 fn cmap_name(input: ParserInput) -> NomResult<()> {
     (
         tag(&b"/CMapName"[..]),
         space0,
-        name,
+        many1(name),
         space1,
         tag(&b"def"[..]),
         multispace1,
@@ -440,6 +442,30 @@ mod tests {
                 ((0x20, 1), vec![0x0020]),
             ])
         );
+    }
+
+    #[test]
+    fn parse_cmap_with_a_path_for_its_name() {
+        // Lay's *Linear Algebra and Its Applications* names its ToUnicode maps after font files.
+        let cmap = b"/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CMapName /Z:/2-Pagination/PearsonUS/TimesLTPro-Roman.otf,000-UTF16 def
+/CMapType 2 def
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+1 beginbfrange
+<0044> <005D> <0061>
+endbfrange
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end
+";
+        let sections = parse(test_span(cmap)).unwrap();
+
+        assert_eq!(sections.len(), 2);
     }
 
     #[test]
