@@ -25,16 +25,18 @@ const MAX_FORM_DEPTH: usize = 8;
 pub struct PageTextRun {
     /// The font's `/BaseFont`, without a subset's `ABCDEF+` prefix; empty when it has none.
     pub font: Vec<u8>,
-    /// The text as the font's encoding decodes it, with the breaks and spaces the page's plain
-    /// text extraction puts in.
+    /// The text as pdfium reads it: through the font's `/ToUnicode` map where it has one, and its
+    /// encoding otherwise, with the breaks and spaces the page's plain text extraction puts in. A
+    /// simple font's code the encoding has no character for reads as the character of its number,
+    /// as pdfium reads it, where the plain text extraction leaves it out.
     pub text: String,
     /// Each code shown, with the byte offset in `text` of the one character it decoded to, for a
-    /// font whose encoding reads a byte at a time. A code that decoded to no character, or to
-    /// several, is left out, and so is every code of a font read through its `/ToUnicode` alone.
+    /// simple font, whose codes are bytes. A code that decoded to several characters is left out,
+    /// and so is every code of a composite font.
     pub codes: Vec<(usize, u8)>,
     /// The glyph names the font's `/Differences` gives codes, spelt as in the file. A name with no
-    /// Unicode reading, such as a type foundry's catalogue number, is kept here, although the text
-    /// then falls back to the standard encoding for the whole font.
+    /// Unicode reading, such as a type foundry's catalogue number, is kept here, while the text
+    /// reads its code by the base encoding.
     pub differences: Rc<BTreeMap<u8, Vec<u8>>>,
 }
 
@@ -43,6 +45,8 @@ struct Font<'a> {
     /// `/BaseFont` without a subset prefix.
     name: Vec<u8>,
     encoding: Encoding<'a>,
+    /// Whether each code is a byte: every font but a composite (`Type0`) one.
+    simple: bool,
     differences: Rc<BTreeMap<u8, Vec<u8>>>,
 }
 
@@ -87,11 +91,25 @@ impl Document {
         Ok(reader.runs)
     }
 
+    /// A font's text reads as pdfium reads it: through its `/ToUnicode` map where it has one, which
+    /// the plain text extraction consults only for a font without `/Encoding`. A font whose
+    /// `/Differences` names glyphs no Unicode reading knows, such as `/g12`, would otherwise read
+    /// those codes by its base encoding.
     fn run_font<'a>(&'a self, font: &'a Dictionary, limits: DecodeLimits) -> Option<Rc<Font<'a>>> {
-        let encoding = font.get_font_encoding_with_limit(self, limits.max_stream_size).ok()?;
+        let to_unicode = font
+            .get(b"ToUnicode")
+            .ok()
+            .and_then(|t| self.dereference(t).ok())
+            .and_then(|(_, t)| t.as_stream().ok())
+            .and_then(|stream| font.get_to_unicode_encoding(stream, Some(limits.max_stream_size)).ok());
+        let encoding = match to_unicode {
+            Some(encoding) => encoding,
+            None => font.get_font_encoding_with_limit(self, limits.max_stream_size).ok()?,
+        };
         Some(Rc::new(Font {
             name: base_font(font),
             encoding,
+            simple: font.get(b"Subtype").and_then(Object::as_name).ok() != Some(b"Type0".as_slice()),
             differences: Rc::new(self.differences(font)),
         }))
     }
@@ -229,7 +247,7 @@ impl<'a, 'c> RunReader<'a, 'c> {
                 }
                 "Tj" | "TJ" => {
                     if let Some(font) = &font {
-                        let _ = run.collect(&font.encoding, &operation.operands);
+                        let _ = run.collect(font, &operation.operands);
                     }
                 }
                 "'" | "\"" => {
@@ -237,7 +255,7 @@ impl<'a, 'c> RunReader<'a, 'c> {
                         run.line_break();
                         let shown = if operation.operator == "'" { 0 } else { 2 };
                         if let Some(string) = operation.operands.get(shown) {
-                            let _ = run.collect(&font.encoding, std::slice::from_ref(string));
+                            let _ = run.collect(font, std::slice::from_ref(string));
                         }
                     }
                 }
@@ -308,14 +326,13 @@ struct Run {
 }
 
 impl Run {
-    /// Reads the strings a text operator shows as the plain text extraction does, byte by byte
-    /// where the encoding reads a byte at a time.
-    fn collect(&mut self, encoding: &Encoding, operands: &[Object]) -> Result<()> {
+    /// Reads the strings a text operator shows as the plain text extraction does.
+    fn collect(&mut self, font: &Font, operands: &[Object]) -> Result<()> {
         for operand in operands {
             match operand {
-                Object::String(bytes, _) => self.show(encoding, bytes)?,
+                Object::String(bytes, _) => self.show(font, bytes)?,
                 Object::Array(array) => {
-                    self.collect(encoding, array)?;
+                    self.collect(font, array)?;
                     self.text.push(' ');
                 }
                 Object::Integer(i) if *i < -100 => self.text.push(' '),
@@ -325,16 +342,26 @@ impl Run {
         Ok(())
     }
 
-    fn show(&mut self, encoding: &Encoding, bytes: &[u8]) -> Result<()> {
-        if !matches!(
-            encoding,
-            Encoding::OneByteEncoding(_) | Encoding::Differences(_) | Encoding::SimpleEncoding(b"WinAnsiEncoding")
-        ) {
+    /// Reads a shown string, a byte at a time where each code is a byte: in a simple font, and in
+    /// any font whose encoding reads bytes.
+    fn show(&mut self, font: &Font, bytes: &[u8]) -> Result<()> {
+        let encoding = &font.encoding;
+        let bytewise = font.simple
+            || matches!(
+                encoding,
+                Encoding::OneByteEncoding(_) | Encoding::Differences(_) | Encoding::SimpleEncoding(b"WinAnsiEncoding")
+            );
+        if !bytewise {
             return encoding.write_to_string(bytes, &mut self.text);
         }
         for &code in bytes {
             let at = self.text.len();
             encoding.write_to_string(&[code], &mut self.text)?;
+            if self.text.len() == at {
+                // A code the encoding has no character for reads as the character of its number,
+                // as pdfium reads it: a symbol font without an encoding draws `−` at code 0.
+                self.text.push(char::from(code));
+            }
             if self.text[at..].chars().count() == 1 {
                 self.codes.push((at, code));
             }

@@ -66,6 +66,9 @@ fn fixture() -> (Vec<u8>, ObjectId) {
         vec![33.into(), "H9266".into(), "H9258".into()],
     );
     let minus = font_with_differences(&mut doc, "MathematicalPiLTStd-5", vec![33.into(), "minus".into()]);
+    // A symbol font with no encoding of its own, read by the standard one, which has no character
+    // at code 0.
+    let symbols = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "MT2SYT" });
 
     let own = doc.add_object(stream(
         dictionary! {
@@ -116,6 +119,10 @@ fn fixture() -> (Vec<u8>, ObjectId) {
                     vec![Object::Array(vec![literal("!"), (-200).into(), literal("!")])],
                 ),
                 Operation::new("ET", vec![]),
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F5".into(), 12.into()]),
+                Operation::new("Tj", vec![Object::String(vec![0x00, b'C'], StringFormat::Literal)]),
+                Operation::new("ET", vec![]),
             ],
         ]
         .concat(),
@@ -126,7 +133,7 @@ fn fixture() -> (Vec<u8>, ObjectId) {
         "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
         "Contents" => content,
         "Resources" => dictionary! {
-            "Font" => dictionary! { "F1" => body, "F2" => maths, "F3" => catalogue, "F4" => minus },
+            "Font" => dictionary! { "F1" => body, "F2" => maths, "F3" => catalogue, "F4" => minus, "F5" => symbols },
             "XObject" => dictionary! { "Own" => own, "Bare" => bare, "Loop" => looping, "Img" => image },
         },
     });
@@ -168,6 +175,7 @@ fn each_run_names_its_font_and_the_forms_a_page_draws_are_read() {
             ("TimesLTStd-Roman", "once"),
             ("MathematicalPi-One-Italic", "!\""),
             ("MathematicalPiLTStd-5", "\u{2212} \u{2212}"),
+            ("MT2SYT", "\u{0}C"),
         ]
         .map(|(font, text)| (font.to_owned(), text.to_owned()))
     );
@@ -195,6 +203,11 @@ fn a_run_keeps_the_codes_it_showed_and_the_names_its_font_gives_them() {
     assert_eq!(minus.text, "\u{2212} \u{2212} \n");
     assert_eq!(minus.codes, [(0, b'!'), (4, b'!')]);
     assert_eq!(*minus.differences, names(&[(33, "minus")]));
+
+    // A code with no character reads as its number, as pdfium reads it, so it can be put right.
+    let symbols = run("MT2SYT");
+    assert_eq!(symbols.text, "\u{0}C\n");
+    assert_eq!(symbols.codes, [(0, 0x00), (1, b'C')]);
 
     let prose = run("TimesLTStd-Roman");
     assert_eq!(prose.codes[..2], [(0, b'H'), (1, b'e')]);
@@ -272,6 +285,61 @@ fn the_font_follows_the_graphics_state_through_q_and_into_forms() {
         ]
         .map(|(font, text)| (font.to_owned(), text.to_owned()))
     );
+}
+
+#[test]
+fn a_font_with_a_unicode_map_reads_through_it_and_keeps_its_codes() {
+    // A subset whose `/Differences` names glyphs no Unicode reading knows, as some producers do,
+    // and whose `/ToUnicode` says what they are: pdfium reads the map, and so do the runs.
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let cmap = b"/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CMapName /Custom def
+/CMapType 2 def
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+2 beginbfchar
+<21> <0048>
+<22> <0069>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end
+";
+    let to_unicode = doc.add_object(Stream::new(dictionary! {}, cmap.to_vec()));
+    let font = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "GillSansStd",
+        "Encoding" => dictionary! { "Type" => "Encoding", "Differences" => vec![33.into(), "g12".into(), "g13".into()] },
+        "ToUnicode" => to_unicode,
+    });
+    let content = doc.add_object(stream(dictionary! {}, show("F1", "!\"")));
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => content,
+        "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_with_options(&mut bytes, SaveOptions::default()).unwrap();
+
+    let [run] = runs(&bytes, page).try_into().unwrap();
+
+    assert_eq!(run.text, "Hi\n");
+    assert_eq!(run.codes, [(0, b'!'), (1, b'"')]);
+    assert_eq!(run.differences.get(&b'!').map(Vec::as_slice), Some(b"g12".as_slice()));
 }
 
 #[test]

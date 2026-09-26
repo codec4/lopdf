@@ -587,7 +587,7 @@ impl Dictionary {
         })
     }
 
-    fn get_to_unicode_encoding(&'_ self, stream: &Stream, limit: Option<usize>) -> Result<Encoding<'_>> {
+    pub(crate) fn get_to_unicode_encoding(&'_ self, stream: &Stream, limit: Option<usize>) -> Result<Encoding<'_>> {
         let content = match limit {
             Some(max) => stream.get_plain_content_with_limit(max)?,
             None => stream.get_plain_content()?,
