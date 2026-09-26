@@ -490,7 +490,8 @@ impl Dictionary {
                     object = o;
                 }
                 Object::Dictionary(ref dict) => {
-                    let ty = dict.get(b"Type")?.as_name()?;
+                    // `/Type /Encoding` is optional, and many producers leave it out.
+                    let ty = dict.get(b"Type").and_then(Object::as_name).unwrap_or(b"Encoding");
 
                     match ty {
                         b"Encoding" => {
@@ -562,14 +563,12 @@ impl Dictionary {
                     current_code = code as u8;
                 }
                 Object::Name(ref name) => {
-                    let Some(glyph) = Glyph::from_name(name) else {
-                        return Err(Error::InvalidEncodingDifferenceGlyph {
-                            name: String::from_utf8_lossy(name).into_owned(),
-                        });
-                    };
-
-                    map.insert(current_code, glyph);
-                    inverse.insert(glyph, current_code);
+                    // A name with no reading leaves its code to the base encoding, rather than the
+                    // whole encoding to the standard one.
+                    if let Some(glyph) = glyph_of_name(name) {
+                        map.insert(current_code, glyph);
+                        inverse.insert(glyph, current_code);
+                    }
                     current_code = current_code.wrapping_add(1);
                 }
                 _ => {
@@ -1370,6 +1369,34 @@ pub(crate) fn filters_of(dict: &Dictionary) -> Result<Vec<&[u8]>> {
     }
 }
 
+/// The glyph a `/Differences` name draws, read as the Adobe Glyph List reads names: a known name,
+/// a name with a variant suffix such as `five.lf` as its base, and `uniXXXX` and `uXXXX` as the
+/// character they spell.
+fn glyph_of_name(name: &[u8]) -> Option<Glyph> {
+    if let Some(glyph) = Glyph::from_name(name) {
+        return Some(glyph);
+    }
+    let base = name
+        .split(|&byte| byte == b'.')
+        .next()
+        .filter(|base| !base.is_empty())?;
+    if let Some(glyph) = Glyph::from_name(base) {
+        return Some(glyph);
+    }
+    let hex = |digits: &[u8]| {
+        std::str::from_utf8(digits)
+            .ok()
+            .filter(|digits| digits.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .and_then(|digits| u16::from_str_radix(digits, 16).ok())
+    };
+    let code_unit = match base {
+        [b'u', b'n', b'i', digits @ ..] if digits.len() >= 4 => hex(&digits[..4]),
+        [b'u', digits @ ..] if digits.len() == 4 => hex(digits),
+        _ => None,
+    }?;
+    Some(Glyph::from_utf16_code_unit(code_unit))
+}
+
 #[cfg(test)]
 mod test {
     use crate::{Error, error::DecompressError};
@@ -1744,5 +1771,26 @@ mod test {
             Stream::decode_run_length(&bomb, Some(64 * 1024)),
             Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) if limit == 64 * 1024
         ));
+    }
+
+    #[test]
+    fn a_differences_encoding_needs_no_type_and_reads_names_as_the_glyph_list_does() {
+        use super::*;
+
+        // Hurley's prose fonts: no `/Type`, lining figures named `five.lf`, a ligature named by its
+        // code point, and a name nothing reads, which leaves its code to the base encoding.
+        let doc = Document::with_version("1.5");
+        let font = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "Encoding" => dictionary! {
+                "BaseEncoding" => "WinAnsiEncoding",
+                "Differences" => vec![1.into(), "five.lf".into(), "uniFB00".into(), "g31".into(), "R".into()],
+            },
+        };
+
+        let encoding = font.get_font_encoding(&doc).unwrap();
+
+        assert_eq!(encoding.bytes_to_string(&[1, 2, 3, 4, b'A']).unwrap(), "5\u{FB00}RA");
     }
 }
