@@ -11,9 +11,13 @@ use std::collections::HashSet;
 
 use super::LazyDocument;
 use super::source::RandomAccessSource;
-use crate::page_content::PageContent;
+use crate::page_content::{ContentStreams, PageContent};
+use crate::page_text_runs::PageTextRun;
 use crate::resolver::skip_unless_io;
 use crate::{DecodeLimits, Dictionary, Document, Object, ObjectId, Result};
+
+/// How deep the forms a page draws are copied, as deep as their text is read.
+const MAX_FORM_DEPTH: usize = 8;
 
 /// Font entries that text extraction never reads and that can hold large streams: embedded font
 /// programs, Type 3 glyph procedures, and Type 3 resources.
@@ -47,12 +51,32 @@ impl<S: RandomAccessSource> LazyDocument<S> {
         })
     }
 
+    /// The text of page `page_id` in runs, each with the font that set it, read into the forms the
+    /// page draws: see [`PageTextRun`]. As [`Self::extract_page_text_with_limits`], content is read
+    /// from the source a chunk at a time, forms' content included, against `limits`.
+    pub fn extract_page_text_runs_with_limits(
+        &self, page_id: ObjectId, limits: DecodeLimits,
+    ) -> Result<Vec<PageTextRun>> {
+        let document = self.page_text_document_with(page_id, true)?;
+        let content = PageContent::new(self, self.page_content_ids(page_id)?, limits, 0);
+        document.page_text_runs(page_id, limits, content, &|id, spent| {
+            Ok(PageContent::new(self, vec![id], limits, spent))
+        })
+    }
+
     /// A document of the single page `page_id`, holding what text extraction reads besides the
     /// content: the page, its ancestors in the page tree, their `/Resources` down to the fonts,
     /// and each font with its encoding and `/ToUnicode` CMap. Objects keep their ids; entries that
     /// extraction never follows, such as images and the content streams, stay as references to
     /// objects that are not copied.
     pub(crate) fn page_text_document(&self, page_id: ObjectId) -> Result<Document> {
+        self.page_text_document_with(page_id, false)
+    }
+
+    /// [`Self::page_text_document`], with, when `forms` is set, the dictionary of each Form XObject
+    /// the page's resources name, its own resources' fonts, and the forms those name in turn. A
+    /// form's content, and every image, stay in the source.
+    fn page_text_document_with(&self, page_id: ObjectId, forms: bool) -> Result<Document> {
         let mut document = Document::with_version(self.version());
         let mut copied = HashSet::new();
 
@@ -60,7 +84,7 @@ impl<S: RandomAccessSource> LazyDocument<S> {
         let mut node = self.copy_object(&mut document, &mut copied, page_id)?;
         let mut ancestors = 0;
         while let Some(Object::Dictionary(dictionary)) = node.take() {
-            self.copy_fonts(&mut document, &mut copied, &dictionary)?;
+            self.copy_fonts(&mut document, &mut copied, &dictionary, forms)?;
             let Ok(parent) = dictionary.get(b"Parent").and_then(Object::as_reference) else {
                 break;
             };
@@ -75,16 +99,70 @@ impl<S: RandomAccessSource> LazyDocument<S> {
 
     /// Copies the fonts of the `/Resources` of a page-tree node: the resources object when it is
     /// a reference, and the closure of its `/Font` entry.
-    fn copy_fonts(&self, document: &mut Document, copied: &mut HashSet<ObjectId>, node: &Dictionary) -> Result<()> {
+    fn copy_fonts(
+        &self, document: &mut Document, copied: &mut HashSet<ObjectId>, node: &Dictionary, forms: bool,
+    ) -> Result<()> {
         let resources = match node.get(b"Resources") {
             Ok(Object::Reference(id)) => self.copy_object(document, copied, *id)?,
             Ok(Object::Dictionary(resources)) => Some(Object::Dictionary(resources.clone())),
             _ => None,
         };
-        if let Some(Object::Dictionary(resources)) = resources
-            && let Ok(fonts) = resources.get(b"Font")
-        {
-            self.copy_closure(document, copied, fonts.clone(), SKIPPED_FONT_KEYS)?;
+        if let Some(Object::Dictionary(resources)) = resources {
+            if let Ok(fonts) = resources.get(b"Font") {
+                self.copy_closure(document, copied, fonts.clone(), SKIPPED_FONT_KEYS)?;
+            }
+            if forms {
+                self.copy_forms(document, copied, &resources, 0)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Copies the Form XObjects a resources dictionary names: each form's dictionary without its
+    /// content, its own resources' fonts, and the forms those name, `depth` forms down. A stream
+    /// is told to be a form from its dictionary alone, so an image is never read.
+    fn copy_forms(
+        &self, document: &mut Document, copied: &mut HashSet<ObjectId>, resources: &Dictionary, depth: usize,
+    ) -> Result<()> {
+        if depth >= MAX_FORM_DEPTH {
+            return Ok(());
+        }
+        let xobjects = match resources.get(b"XObject") {
+            Ok(Object::Reference(id)) => self.copy_object(document, copied, *id)?,
+            Ok(Object::Dictionary(xobjects)) => Some(Object::Dictionary(xobjects.clone())),
+            _ => None,
+        };
+        let Some(Object::Dictionary(xobjects)) = xobjects else {
+            return Ok(());
+        };
+        for (_, value) in xobjects.iter() {
+            let Ok(id) = value.as_reference() else {
+                continue;
+            };
+            if copied.contains(&id) {
+                continue;
+            }
+            let Some(stream) = skip_unless_io(ContentStreams::open(self, id))?.flatten() else {
+                continue;
+            };
+            if stream.dict.get(b"Subtype").and_then(Object::as_name).ok() != Some(b"Form".as_slice()) {
+                continue;
+            }
+            copied.insert(id);
+            let form = stream.dict.into_owned();
+            let own = match form.get(b"Resources") {
+                Ok(Object::Reference(resources)) => self.copy_object(document, copied, *resources)?,
+                Ok(Object::Dictionary(resources)) => Some(Object::Dictionary(resources.clone())),
+                _ => None,
+            };
+            document.objects.insert(id, Object::Dictionary(form));
+            document.max_id = document.max_id.max(id.0);
+            if let Some(Object::Dictionary(own)) = own {
+                if let Ok(fonts) = own.get(b"Font") {
+                    self.copy_closure(document, copied, fonts.clone(), SKIPPED_FONT_KEYS)?;
+                }
+                self.copy_forms(document, copied, &own, depth + 1)?;
+            }
         }
         Ok(())
     }

@@ -389,7 +389,7 @@ impl Document {
         self.change_page_content(page_id, modified_content)
     }
 }
-fn collect_text(text: &mut String, encoding: &Encoding, operands: &[Object]) -> Result<()> {
+pub(crate) fn collect_text(text: &mut String, encoding: &Encoding, operands: &[Object]) -> Result<()> {
     for operand in operands.iter() {
         match operand {
             Object::String(bytes, _) => {

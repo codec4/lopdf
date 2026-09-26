@@ -30,6 +30,8 @@ mod page_content;
 mod page_geometry;
 mod page_labels;
 mod page_links;
+#[cfg(feature = "lazy-reader")]
+mod page_text_runs;
 mod processor;
 mod toc;
 mod writer;
@@ -64,6 +66,8 @@ pub use page_content::DecodeLimits;
 pub use page_geometry::{DisplayedRect, PageGeometry, PageRect};
 pub use page_labels::PageLabels;
 pub use page_links::{LinkTarget, PageLink, PageLinkLimits, PageLinkReader, PageLinks};
+#[cfg(feature = "lazy-reader")]
+pub use page_text_runs::PageTextRun;
 pub use reader::{PdfMetadata, Reader};
 pub use resolver::ObjectResolver;
 pub use save_options::{SaveOptions, SaveOptionsBuilder};
